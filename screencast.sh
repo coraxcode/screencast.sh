@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # screencast.sh — Professional X11 Screen Recorder for Linux
-# Version : 2.3.0
+# Version : 2.4.0
 # License : MIT
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
@@ -15,7 +15,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.3.0"
+readonly PROG_VERSION="2.4.0"
 readonly PROG_DESC="Professional X11 Screen Recorder"
 
 # ── Colors (test fd 2; all messages go to stderr) ───────────────────────────
@@ -34,10 +34,21 @@ RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
 LOGFILE="${SCREENCAST_LOG:-${RUNDIR}/${PROG_NAME}.log}"
 
 # ── State ───────────────────────────────────────────────────────────────────
-MODE=""  QUALITY=""  SYS_AUDIO=false  MIC_AUDIO=false  MUTE=false
-COUNTDOWN=3  FFPID=""  OUTFILE=""
+MODE=""                 # fullscreen | select | resolution
+QUALITY=""              # youtube | light
+SYS_AUDIO=false         # -a
+MIC_AUDIO=false         # -v
+MUTE=false              # -m
+COUNTDOWN=3             # seconds before recording
+FFPID=""                # ffmpeg background PID
+OUTFILE=""              # final output path
+REQUESTED_RES=""        # WxH string from -r (e.g. "1280x720")
+
+# Quality profile values (set by apply_quality_profile)
 FPS=30  CRF=28  PRESET="veryfast"  ABR="128k"
 MAXRATE=""  BUFSIZE=""  GOP=""
+
+# Audio arrays (populated by setup_audio)
 AUDIO_INPUTS=()  AUDIO_DESC=()
 
 # ── Messaging (ALL to stderr — stdout reserved for data) ────────────────────
@@ -59,6 +70,8 @@ ${C_BOLD}USAGE${C_RESET}
 ${C_BOLD}CAPTURE MODE${C_RESET} (pick one — required)
     -f            Record the entire screen (fullscreen)
     -s            Select a region with the mouse (requires ${C_BOLD}slop${C_RESET})
+    -r WxH        Record a centered area of exactly WxH pixels
+                  (e.g. ${C_BOLD}-r 1280x720${C_RESET}, ${C_BOLD}-r 800x600${C_RESET}, ${C_BOLD}-r 1920x1080${C_RESET})
 
 ${C_BOLD}QUALITY PROFILE${C_RESET} (pick one — required)
     -q1           ${C_GREEN}YouTube / Professional${C_RESET}
@@ -80,10 +93,12 @@ ${C_BOLD}STOP RECORDING${C_RESET}
     Press ${C_BOLD}Ctrl+C${C_RESET} in the terminal or send SIGINT/SIGTERM.
 
 ${C_BOLD}EXAMPLES${C_RESET}
-    ${PROG_NAME} -f -q1 -a           # Fullscreen, YouTube quality, system audio
-    ${PROG_NAME} -s -q2              # Select area, light quality, no audio
-    ${PROG_NAME} -s -q1 -a -v        # Select, YouTube, system + mic
-    ${PROG_NAME} -f -q2 -m           # Fullscreen, light, mute
+    ${PROG_NAME} -f -q1 -a             # Fullscreen, YouTube quality, system audio
+    ${PROG_NAME} -s -q2                # Select area, light quality, no audio
+    ${PROG_NAME} -r 1280x720 -q1 -a   # Centered 720p, YouTube, system audio
+    ${PROG_NAME} -r 800x600 -q2       # Centered 800×600, light, no audio
+    ${PROG_NAME} -s -q1 -a -v          # Select, YouTube, system + mic
+    ${PROG_NAME} -f -q2 -m             # Fullscreen, light, mute
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
     SCREENCAST_OUTDIR    Output directory  (default: ~/Videos)
@@ -93,6 +108,8 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
 ${C_BOLD}NOTES${C_RESET}
     • In -s mode you can switch i3/Sway workspaces before clicking — slop's
       keyboard cancel is disabled when the installed version supports it.
+    • -r WxH captures a centered rectangle from your screen. The requested
+      size must fit within your screen. Odd values are rounded down to even.
     • Output is always YouTube-compliant MP4: H.264 High + AAC-LC, yuv420p,
       -movflags +faststart, closed GOP, BT.709 color tags.
     • Works on Debian, Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo.
@@ -102,12 +119,26 @@ EOF
 version() { msg "${PROG_NAME} ${PROG_VERSION}"; }
 
 # ── Argument parsing ────────────────────────────────────────────────────────
+set_mode() {
+    local new_mode="$1"
+    if [[ -n "$MODE" && "$MODE" != "$new_mode" ]]; then
+        die "Conflicting modes: -f, -s, and -r are mutually exclusive."
+    fi
+    MODE="$new_mode"
+}
+
 parse_args() {
     if (( $# == 0 )); then usage; exit 0; fi
     while (( $# )); do
         case "$1" in
-            -f)         MODE="fullscreen" ;;
-            -s)         MODE="select" ;;
+            -f)         set_mode "fullscreen" ;;
+            -s)         set_mode "select" ;;
+            -r)
+                set_mode "resolution"
+                shift
+                [[ -n "${1:-}" ]] || die "-r requires a resolution argument (e.g. -r 1280x720)"
+                REQUESTED_RES="$1"
+                ;;
             -a)         SYS_AUDIO=true ;;
             -v)         MIC_AUDIO=true ;;
             -m)         MUTE=true ;;
@@ -121,7 +152,7 @@ parse_args() {
         esac
         shift
     done
-    [[ -n "$MODE" ]]    || die "A capture mode is required: -f (fullscreen) or -s (select)"
+    [[ -n "$MODE" ]]    || die "A capture mode is required: -f, -s, or -r WxH"
     [[ -n "$QUALITY" ]] || die "A quality profile is required: -q1 (youtube) or -q2 (light)"
     if $MUTE; then SYS_AUDIO=false; MIC_AUDIO=false; fi
 }
@@ -153,8 +184,6 @@ apply_quality_profile() {
 }
 
 # ── Detect ffmpeg -fps_mode vs -vsync ──────────────────────────────────────
-# ffmpeg ≥ 5.0 deprecated -vsync in favor of -fps_mode.
-# Older versions only support -vsync. We detect at runtime.
 detect_fps_mode_flag() {
     if ffmpeg -hide_banner -h full 2>/dev/null | grep -q -- '-fps_mode'; then
         echo "-fps_mode"
@@ -164,7 +193,7 @@ detect_fps_mode_flag() {
 }
 
 # ── Screen Geometry ─────────────────────────────────────────────────────────
-# Prints ONLY "X Y W H" to stdout. Nothing else.
+# Prints ONLY "X Y W H" to stdout.
 get_root_geometry() {
     if command -v xrandr >/dev/null 2>&1; then
         local line result
@@ -196,6 +225,60 @@ get_root_geometry() {
     return 1
 }
 
+# ── Resolution parser & validator ───────────────────────────────────────────
+# Parses "WxH" string, validates format and numeric ranges.
+# Prints "W H" to stdout on success.
+parse_resolution() {
+    local res="$1"
+
+    # Accept WxH, Wx H, or W×H (Unicode ×)
+    local rw rh
+    if [[ "$res" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
+        rw="${BASH_REMATCH[1]}"
+        rh="${BASH_REMATCH[2]}"
+    else
+        die "Invalid resolution format: '${res}'. Expected WxH (e.g. 1280x720, 800x600)."
+    fi
+
+    # Sanity: must be at least 16×16 (H.264 macroblock minimum)
+    if (( rw < 16 || rh < 16 )); then
+        die "Requested resolution ${rw}×${rh} is too small. Minimum is 16x16."
+    fi
+
+    # Sanity: cap at 7680×4320 (8K) to catch typos like 12800x720
+    if (( rw > 7680 || rh > 4320 )); then
+        die "Requested resolution ${rw}×${rh} exceeds 8K maximum (7680x4320)."
+    fi
+
+    echo "$rw $rh"
+}
+
+# Computes the centered capture region for a given resolution on screen.
+# Takes: requested_w, requested_h, screen_w, screen_h
+# Prints: "X Y W H" to stdout (with even W and H).
+compute_centered_geometry() {
+    local rw="$1" rh="$2" sw="$3" sh="$4"
+
+    # Enforce even dimensions on the requested size
+    (( rw % 2 != 0 )) && rw=$(( rw - 1 )) || true
+    (( rh % 2 != 0 )) && rh=$(( rh - 1 )) || true
+
+    # Must fit within the screen
+    if (( rw > sw )); then
+        die "Requested width ${rw} exceeds screen width ${sw}."
+    fi
+    if (( rh > sh )); then
+        die "Requested height ${rh} exceeds screen height ${sh}."
+    fi
+
+    # Calculate centered offsets
+    local cx cy
+    cx=$(( (sw - rw) / 2 ))
+    cy=$(( (sh - rh) / 2 ))
+
+    echo "$cx $cy $rw $rh"
+}
+
 # ── slop helpers ────────────────────────────────────────────────────────────
 build_slop_opts() {
     local ht
@@ -207,7 +290,6 @@ build_slop_opts() {
     elif grep -qi -- '\-\-gracetime'  <<< "$ht"; then o+=(--gracetime=999999)
     fi
     grep -qi -- '\-\-color' <<< "$ht" && o+=(--color=0.3,0.5,1,0.4)
-    # Safe: only print if array is non-empty
     (( ${#o[@]} > 0 )) && printf '%s\n' "${o[@]}"
     return 0
 }
@@ -223,7 +305,6 @@ select_geometry() {
     info "(You can switch i3/Sway workspaces before clicking)"
 
     local sel
-    # Safe empty-array expansion: check length before expanding
     if (( ${#opts[@]} > 0 )); then
         sel="$(slop "${opts[@]}" -f '%x %y %w %h' 2>/dev/null)" || true
     else
@@ -243,8 +324,6 @@ select_geometry() {
 
 enforce_even_dimensions() {
     local x="$1" y="$2" w="$3" h="$4"
-    # (( w-- )) when w=1 produces 0, and (( 0 )) returns exit 1.
-    # The || true on the WHOLE line handles both branches safely.
     (( w % 2 != 0 )) && w=$(( w - 1 )) || true
     (( h % 2 != 0 )) && h=$(( h - 1 )) || true
     echo "$x $y $w $h"
@@ -264,7 +343,7 @@ choose_from_list() {
     local idx=1
     for item in "${items[@]}"; do
         printf "  ${C_CYAN}%2d${C_RESET}) %s\n" "$idx" "$item" >&2
-        idx=$(( idx + 1 ))   # Arithmetic assignment — never returns exit 1
+        idx=$(( idx + 1 ))
     done
     printf '\n' >&2
     local choice
@@ -311,7 +390,6 @@ setup_audio() {
     AUDIO_INPUTS=()
     AUDIO_DESC=()
 
-    # System / desktop audio
     if $SYS_AUDIO; then
         if has_pactl; then
             local sys_src
@@ -328,7 +406,6 @@ setup_audio() {
         fi
     fi
 
-    # Microphone
     if $MIC_AUDIO; then
         require_tty
         if has_pactl; then
@@ -394,20 +471,9 @@ run_countdown() {
     printf '\r%s\n' "                                         " >&2
 }
 
-# ============================================================================
-# SIGNAL HANDLING
-#
-# When Ctrl+C is pressed, the kernel sends SIGINT to every process in the
-# foreground group. If both the shell and ffmpeg die simultaneously, ffmpeg
-# can't finalize the MP4 (write the moov atom) → corrupt/unplayable file.
-#
-# Fix: Before launching ffmpeg we do  trap '' INT TERM  so the shell
-# ignores both signals. Only ffmpeg receives them, shuts down gracefully
-# (flushes buffers, writes moov atom, closes file), then exits. The
-# shell's wait returns, and we print the summary.
-#
-# The EXIT trap is a safety net for unexpected shell termination.
-# ============================================================================
+# ── Signal handling ─────────────────────────────────────────────────────────
+# See v2.2.0+ notes: the shell ignores INT+TERM during recording so only
+# ffmpeg receives the signal and can write the MP4 moov atom before exiting.
 cleanup_on_exit() {
     trap '' EXIT INT TERM
     if [[ -n "${FFPID:-}" ]] && kill -0 "$FFPID" 2>/dev/null; then
@@ -448,11 +514,9 @@ print_summary() {
 build_and_run() {
     local x="$1" y="$2" w="$3" h="$4"
 
-    # Detect the correct constant-framerate flag for this ffmpeg version
     local fps_flag
     fps_flag="$(detect_fps_mode_flag)"
 
-    # Video input
     local -a vid_in=(
         -f x11grab
         -draw_mouse 1
@@ -462,8 +526,6 @@ build_and_run() {
         -i "${DISPLAY_NAME}+${x},${y}"
     )
 
-    # Video encoder — H.264 High Profile, closed GOP, BT.709
-    # Level is auto-detected by libx264 to support any resolution (1080p–4K+)
     local -a vid_enc=(
         -c:v libx264
         -profile:v high
@@ -482,22 +544,18 @@ build_and_run() {
         -color_primaries bt709
     )
 
-    # Audio encoder (only if we have audio inputs)
     local -a aud_enc=()
     if (( ${#AUDIO_INPUTS[@]} > 0 )); then
         aud_enc=( -c:a aac -b:a "$ABR" -ar 48000 -ac 2 )
     fi
 
-    # Assemble command
     local -a cmd=( ffmpeg -hide_banner -nostdin -y )
     cmd+=( "${vid_in[@]}" )
 
-    # Audio inputs — safe expansion: only add if non-empty
     if (( ${#AUDIO_INPUTS[@]} > 0 )); then
         cmd+=( "${AUDIO_INPUTS[@]}" )
     fi
 
-    # Stream mapping & mixing
     local n_audio=${#AUDIO_DESC[@]}
     if (( n_audio >= 2 )); then
         cmd+=(
@@ -509,14 +567,12 @@ build_and_run() {
         cmd+=( -map 0:v -map 1:a )
     fi
 
-    # Encoders
     cmd+=( "${vid_enc[@]}" )
     if (( ${#aud_enc[@]} > 0 )); then
         cmd+=( "${aud_enc[@]}" )
     fi
     cmd+=( -movflags +faststart "$OUTFILE" )
 
-    # Write session to log
     {
         echo "════════════════════════════════════════════════════════════"
         echo "$(date '+%Y-%m-%d %H:%M:%S') — ${PROG_NAME} v${PROG_VERSION}"
@@ -533,30 +589,26 @@ build_and_run() {
         echo "════════════════════════════════════════════════════════════"
     } >> "$LOGFILE"
 
-    # Countdown
     run_countdown "$COUNTDOWN"
 
-    # Recording banner
     local audio_summary="mute"
     (( ${#AUDIO_DESC[@]} > 0 )) && audio_summary="${AUDIO_DESC[*]}"
 
     msg ""
     msg "  ${C_RED}● REC${C_RESET}  ${C_BOLD}Recording${C_RESET}  →  ${OUTFILE}"
     msg "         ${w}×${h} @ ${FPS}fps · ${QUALITY} · ${audio_summary}"
+    if [[ "$MODE" == "resolution" ]]; then
+        msg "         Centered at +${x},+${y} on screen"
+    fi
     msg "         Press ${C_BOLD}Ctrl+C${C_RESET} to stop"
     msg ""
 
-    # ┌──────────────────────────────────────────────────────────────────┐
-    # │  CRITICAL: Ignore INT + TERM in the shell so ONLY ffmpeg gets   │
-    # │  the signal and can write the MP4 moov atom before exiting.     │
-    # └──────────────────────────────────────────────────────────────────┘
     trap '' INT TERM
 
     "${cmd[@]}" >> "$LOGFILE" 2>&1 &
     FFPID=$!
     wait "$FFPID" || true
 
-    # Restore normal signal handling
     trap - INT TERM
 
     msg ""
@@ -576,35 +628,76 @@ main() {
 
     local x=0 y=0 w=0 h=0
 
-    if [[ "$MODE" == "fullscreen" ]]; then
-        local geom
-        geom="$(get_root_geometry)" || true
-        [[ -n "${geom:-}" ]] || die "Cannot detect screen size. Install xrandr, xwininfo, or xdpyinfo."
-        read -r x y w h <<< "$geom"
-        info "Fullscreen capture: ${w}×${h}"
-    else
-        local geom
-        geom="$(select_geometry)" || true
-        if [[ -z "${geom:-}" ]]; then msg "Selection cancelled."; exit 0; fi
-        read -r x y w h <<< "$geom"
-        info "Selected area: ${w}×${h} at +${x},+${y}"
-    fi
+    case "$MODE" in
+        fullscreen)
+            local geom
+            geom="$(get_root_geometry)" || true
+            [[ -n "${geom:-}" ]] || die "Cannot detect screen size. Install xrandr, xwininfo, or xdpyinfo."
+            read -r x y w h <<< "$geom"
+            info "Fullscreen capture: ${w}×${h}"
+            ;;
 
-    # Validate geometry — all must be non-negative integers
+        select)
+            local geom
+            geom="$(select_geometry)" || true
+            if [[ -z "${geom:-}" ]]; then msg "Selection cancelled."; exit 0; fi
+            read -r x y w h <<< "$geom"
+            info "Selected area: ${w}×${h} at +${x},+${y}"
+            ;;
+
+        resolution)
+            # 1. Parse the requested resolution
+            local rw rh
+            read -r rw rh <<< "$(parse_resolution "$REQUESTED_RES")"
+
+            # 2. Get the actual screen size
+            local screen_geom
+            screen_geom="$(get_root_geometry)" || true
+            [[ -n "${screen_geom:-}" ]] || die "Cannot detect screen size. Install xrandr, xwininfo, or xdpyinfo."
+
+            local sx sy sw sh
+            read -r sx sy sw sh <<< "$screen_geom"
+
+            info "Screen size: ${sw}×${sh}"
+            info "Requested: ${rw}×${rh} (centered)"
+
+            # 3. Compute the centered capture region
+            read -r x y w h <<< "$(compute_centered_geometry "$rw" "$rh" "$sw" "$sh")"
+
+            info "Capture region: ${w}×${h} at +${x},+${y}"
+            ;;
+
+        *)
+            die "Internal error: unknown mode '${MODE}'"
+            ;;
+    esac
+
+    # Validate geometry
     if [[ ! "${w:-0}" =~ ^[0-9]+$ ]] || [[ ! "${h:-0}" =~ ^[0-9]+$ ]] || \
        [[ ! "${x:-0}" =~ ^[0-9]+$ ]] || [[ ! "${y:-0}" =~ ^[0-9]+$ ]]; then
         die "Invalid geometry (x=${x:-?} y=${y:-?} w=${w:-?} h=${h:-?})."
     fi
     (( w >= 16 && h >= 16 )) || die "Capture area too small (${w}×${h}). Minimum is 16×16."
 
-    read -r x y w h <<< "$(enforce_even_dimensions "$x" "$y" "$w" "$h")"
+    # For -f and -s modes, enforce even dimensions (resolution mode already does it)
+    if [[ "$MODE" != "resolution" ]]; then
+        read -r x y w h <<< "$(enforce_even_dimensions "$x" "$y" "$w" "$h")"
+    fi
 
     setup_audio
 
-    local stamp audio_tag
+    local stamp audio_tag mode_tag
     stamp="$(date '+%Y-%m-%d_%H%M%S')"
     (( ${#AUDIO_DESC[@]} > 0 )) && audio_tag="audio" || audio_tag="mute"
-    OUTFILE="${OUTDIR}/${PROG_NAME}_${stamp}_${MODE}_${QUALITY}_${audio_tag}.mp4"
+
+    # Use descriptive mode tag in filename
+    case "$MODE" in
+        fullscreen)  mode_tag="full" ;;
+        select)      mode_tag="select" ;;
+        resolution)  mode_tag="${w}x${h}" ;;
+    esac
+
+    OUTFILE="${OUTDIR}/${PROG_NAME}_${stamp}_${mode_tag}_${QUALITY}_${audio_tag}.mp4"
 
     build_and_run "$x" "$y" "$w" "$h"
 }
