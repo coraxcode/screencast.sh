@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # screencast.sh — Professional X11 Screen Recorder for Linux
-# Version : 2.4.0
+# Version : 2.5.0
 # License : MIT
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
@@ -15,7 +15,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.4.0"
+readonly PROG_VERSION="2.5.0"
 readonly PROG_DESC="Professional X11 Screen Recorder"
 
 # ── Colors (test fd 2; all messages go to stderr) ───────────────────────────
@@ -34,7 +34,7 @@ RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
 LOGFILE="${SCREENCAST_LOG:-${RUNDIR}/${PROG_NAME}.log}"
 
 # ── State ───────────────────────────────────────────────────────────────────
-MODE=""                 # fullscreen | select | resolution
+MODE=""                 # fullscreen | select | resolution | window
 QUALITY=""              # youtube | light
 SYS_AUDIO=false         # -a
 MIC_AUDIO=false         # -v
@@ -42,7 +42,7 @@ MUTE=false              # -m
 COUNTDOWN=3             # seconds before recording
 FFPID=""                # ffmpeg background PID
 OUTFILE=""              # final output path
-REQUESTED_RES=""        # WxH string from -r (e.g. "1280x720")
+REQUESTED_RES=""        # WxH string from -r
 
 # Quality profile values (set by apply_quality_profile)
 FPS=30  CRF=28  PRESET="veryfast"  ABR="128k"
@@ -70,8 +70,9 @@ ${C_BOLD}USAGE${C_RESET}
 ${C_BOLD}CAPTURE MODE${C_RESET} (pick one — required)
     -f            Record the entire screen (fullscreen)
     -s            Select a region with the mouse (requires ${C_BOLD}slop${C_RESET})
+    -w            Click a window to record it (requires ${C_BOLD}xwininfo${C_RESET})
     -r WxH        Record a centered area of exactly WxH pixels
-                  (e.g. ${C_BOLD}-r 1280x720${C_RESET}, ${C_BOLD}-r 800x600${C_RESET}, ${C_BOLD}-r 1920x1080${C_RESET})
+                  (e.g. ${C_BOLD}-r 1280x720${C_RESET}, ${C_BOLD}-r 800x600${C_RESET})
 
 ${C_BOLD}QUALITY PROFILE${C_RESET} (pick one — required)
     -q1           ${C_GREEN}YouTube / Professional${C_RESET}
@@ -94,9 +95,9 @@ ${C_BOLD}STOP RECORDING${C_RESET}
 
 ${C_BOLD}EXAMPLES${C_RESET}
     ${PROG_NAME} -f -q1 -a             # Fullscreen, YouTube quality, system audio
+    ${PROG_NAME} -w -q1 -a             # Click a window, YouTube, system audio
     ${PROG_NAME} -s -q2                # Select area, light quality, no audio
     ${PROG_NAME} -r 1280x720 -q1 -a   # Centered 720p, YouTube, system audio
-    ${PROG_NAME} -r 800x600 -q2       # Centered 800×600, light, no audio
     ${PROG_NAME} -s -q1 -a -v          # Select, YouTube, system + mic
     ${PROG_NAME} -f -q2 -m             # Fullscreen, light, mute
 
@@ -106,10 +107,11 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
     DISPLAY              X11 display       (default: :0)
 
 ${C_BOLD}NOTES${C_RESET}
-    • In -s mode you can switch i3/Sway workspaces before clicking — slop's
-      keyboard cancel is disabled when the installed version supports it.
-    • -r WxH captures a centered rectangle from your screen. The requested
-      size must fit within your screen. Odd values are rounded down to even.
+    • -w uses xwininfo to capture the geometry of the clicked window
+      (including WM decorations). If the window is partially off-screen,
+      the capture area is automatically clamped to visible bounds.
+    • In -s mode you can switch i3/Sway workspaces before clicking.
+    • -r WxH captures a centered rectangle. Must fit within your screen.
     • Output is always YouTube-compliant MP4: H.264 High + AAC-LC, yuv420p,
       -movflags +faststart, closed GOP, BT.709 color tags.
     • Works on Debian, Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo.
@@ -122,7 +124,7 @@ version() { msg "${PROG_NAME} ${PROG_VERSION}"; }
 set_mode() {
     local new_mode="$1"
     if [[ -n "$MODE" && "$MODE" != "$new_mode" ]]; then
-        die "Conflicting modes: -f, -s, and -r are mutually exclusive."
+        die "Conflicting modes: -f, -s, -w, and -r are mutually exclusive."
     fi
     MODE="$new_mode"
 }
@@ -131,28 +133,35 @@ parse_args() {
     if (( $# == 0 )); then usage; exit 0; fi
     while (( $# )); do
         case "$1" in
-            -f)         set_mode "fullscreen" ;;
-            -s)         set_mode "select" ;;
+            -f)  set_mode "fullscreen" ;;
+            -s)  set_mode "select" ;;
+            -w)  set_mode "window" ;;
             -r)
                 set_mode "resolution"
+                # Validate that the next argument exists and is not a flag
+                if [[ -z "${2:-}" ]]; then
+                    die "-r requires a resolution argument (e.g. -r 1280x720)."
+                fi
+                if [[ "${2}" == -* ]]; then
+                    die "-r requires a resolution value, got flag '${2}' instead. Usage: -r 1280x720"
+                fi
                 shift
-                [[ -n "${1:-}" ]] || die "-r requires a resolution argument (e.g. -r 1280x720)"
                 REQUESTED_RES="$1"
                 ;;
-            -a)         SYS_AUDIO=true ;;
-            -v)         MIC_AUDIO=true ;;
-            -m)         MUTE=true ;;
-            -q1)        QUALITY="youtube" ;;
-            -q2)        QUALITY="light" ;;
-            -n)         COUNTDOWN=0 ;;
+            -a)  SYS_AUDIO=true ;;
+            -v)  MIC_AUDIO=true ;;
+            -m)  MUTE=true ;;
+            -q1) QUALITY="youtube" ;;
+            -q2) QUALITY="light" ;;
+            -n)  COUNTDOWN=0 ;;
             -h|--help)  usage; exit 0 ;;
             --version)  version; exit 0 ;;
-            -*)         die "Unknown option: ${1}  (try ${PROG_NAME} -h)" ;;
-            *)          die "Unexpected argument: ${1}" ;;
+            -*)  die "Unknown option: ${1}  (try ${PROG_NAME} -h)" ;;
+            *)   die "Unexpected argument: ${1}" ;;
         esac
         shift
     done
-    [[ -n "$MODE" ]]    || die "A capture mode is required: -f, -s, or -r WxH"
+    [[ -n "$MODE" ]]    || die "A capture mode is required: -f, -s, -w, or -r WxH"
     [[ -n "$QUALITY" ]] || die "A quality profile is required: -q1 (youtube) or -q2 (light)"
     if $MUTE; then SYS_AUDIO=false; MIC_AUDIO=false; fi
 }
@@ -164,6 +173,10 @@ check_dependencies() {
     if [[ "$MODE" == "select" ]]; then
         command -v slop >/dev/null 2>&1 \
             || die "slop is not installed (required for -s). Install: apt/dnf/pacman install slop"
+    fi
+    if [[ "$MODE" == "window" ]]; then
+        command -v xwininfo >/dev/null 2>&1 \
+            || die "xwininfo is not installed (required for -w). Install: apt install x11-utils / dnf install xorg-x11-utils / pacman -S xorg-xwininfo"
     fi
     if $SYS_AUDIO || $MIC_AUDIO; then
         if ! command -v pactl >/dev/null 2>&1 && ! command -v arecord >/dev/null 2>&1; then
@@ -225,13 +238,85 @@ get_root_geometry() {
     return 1
 }
 
+# ── Window capture ──────────────────────────────────────────────────────────
+# Uses xwininfo interactively: user clicks a window, we parse its geometry.
+# The -frame flag includes WM decorations (title bar, borders) so the full
+# visible window is captured — works on floating WMs (XFCE, KDE, GNOME)
+# and tiling WMs (i3, bspwm, Sway-on-XWayland) equally well.
+#
+# Prints "X Y W H TITLE" to stdout (title may contain spaces).
+# Returns 1 on cancel or failure.
+select_window_geometry() {
+    info "Click on the window you want to record..."
+
+    local wi_output
+    wi_output="$(xwininfo -frame 2>/dev/null)" || true
+    if [[ -z "${wi_output:-}" ]]; then
+        return 1
+    fi
+
+    # Parse the four geometry fields
+    local wx wy ww wh
+    wx="$(awk '/Absolute upper-left X:/{print $NF; exit}' <<< "$wi_output")" || true
+    wy="$(awk '/Absolute upper-left Y:/{print $NF; exit}' <<< "$wi_output")" || true
+    ww="$(awk '/Width:/{print $NF; exit}' <<< "$wi_output")" || true
+    wh="$(awk '/Height:/{print $NF; exit}' <<< "$wi_output")" || true
+
+    # Parse the window title (for logging/display)
+    local wtitle
+    wtitle="$(awk -F'"' '/xwininfo: Window id:/{print $2; exit}' <<< "$wi_output")" || true
+
+    # Validate all four values are integers (may be negative for off-screen windows)
+    if [[ ! "${wx:-}" =~ ^-?[0-9]+$ ]] || [[ ! "${wy:-}" =~ ^-?[0-9]+$ ]] || \
+       [[ ! "${ww:-}" =~ ^[0-9]+$ ]]   || [[ ! "${wh:-}" =~ ^[0-9]+$ ]]; then
+        err "xwininfo returned unexpected geometry (x=${wx:-?} y=${wy:-?} w=${ww:-?} h=${wh:-?})."
+        return 1
+    fi
+
+    if (( ww < 1 || wh < 1 )); then
+        err "Selected window has no visible area (${ww}×${wh})."
+        return 1
+    fi
+
+    echo "${wx} ${wy} ${ww} ${wh} ${wtitle:-untitled}"
+}
+
+# Clamp a window rectangle to fit within the visible screen.
+# Handles windows partially dragged off-screen in any direction.
+# Input:  window_x window_y window_w window_h screen_w screen_h
+# Output: "X Y W H" (all non-negative, within screen bounds)
+clamp_to_screen() {
+    local wx="$1" wy="$2" ww="$3" wh="$4" sw="$5" sh="$6"
+
+    # Left/top overflow: shift origin to 0, shrink dimensions
+    if (( wx < 0 )); then
+        ww=$(( ww + wx ))
+        wx=0
+    fi
+    if (( wy < 0 )); then
+        wh=$(( wh + wy ))
+        wy=0
+    fi
+
+    # Right/bottom overflow: shrink dimensions to fit
+    if (( wx + ww > sw )); then
+        ww=$(( sw - wx ))
+    fi
+    if (( wy + wh > sh )); then
+        wh=$(( sh - wy ))
+    fi
+
+    # Safety: if clamping reduced dimensions to zero or negative
+    if (( ww < 1 || wh < 1 )); then
+        return 1
+    fi
+
+    echo "$wx $wy $ww $wh"
+}
+
 # ── Resolution parser & validator ───────────────────────────────────────────
-# Parses "WxH" string, validates format and numeric ranges.
-# Prints "W H" to stdout on success.
 parse_resolution() {
     local res="$1"
-
-    # Accept WxH, Wx H, or W×H (Unicode ×)
     local rw rh
     if [[ "$res" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
         rw="${BASH_REMATCH[1]}"
@@ -239,43 +324,24 @@ parse_resolution() {
     else
         die "Invalid resolution format: '${res}'. Expected WxH (e.g. 1280x720, 800x600)."
     fi
-
-    # Sanity: must be at least 16×16 (H.264 macroblock minimum)
     if (( rw < 16 || rh < 16 )); then
         die "Requested resolution ${rw}×${rh} is too small. Minimum is 16x16."
     fi
-
-    # Sanity: cap at 7680×4320 (8K) to catch typos like 12800x720
     if (( rw > 7680 || rh > 4320 )); then
         die "Requested resolution ${rw}×${rh} exceeds 8K maximum (7680x4320)."
     fi
-
     echo "$rw $rh"
 }
 
-# Computes the centered capture region for a given resolution on screen.
-# Takes: requested_w, requested_h, screen_w, screen_h
-# Prints: "X Y W H" to stdout (with even W and H).
 compute_centered_geometry() {
     local rw="$1" rh="$2" sw="$3" sh="$4"
-
-    # Enforce even dimensions on the requested size
     (( rw % 2 != 0 )) && rw=$(( rw - 1 )) || true
     (( rh % 2 != 0 )) && rh=$(( rh - 1 )) || true
-
-    # Must fit within the screen
-    if (( rw > sw )); then
-        die "Requested width ${rw} exceeds screen width ${sw}."
-    fi
-    if (( rh > sh )); then
-        die "Requested height ${rh} exceeds screen height ${sh}."
-    fi
-
-    # Calculate centered offsets
+    if (( rw > sw )); then die "Requested width ${rw} exceeds screen width ${sw}."; fi
+    if (( rh > sh )); then die "Requested height ${rh} exceeds screen height ${sh}."; fi
     local cx cy
     cx=$(( (sw - rw) / 2 ))
     cy=$(( (sh - rh) / 2 ))
-
     echo "$cx $cy $rw $rh"
 }
 
@@ -472,8 +538,6 @@ run_countdown() {
 }
 
 # ── Signal handling ─────────────────────────────────────────────────────────
-# See v2.2.0+ notes: the shell ignores INT+TERM during recording so only
-# ffmpeg receives the signal and can write the MP4 moov atom before exiting.
 cleanup_on_exit() {
     trap '' EXIT INT TERM
     if [[ -n "${FFPID:-}" ]] && kill -0 "$FFPID" 2>/dev/null; then
@@ -599,6 +663,8 @@ build_and_run() {
     msg "         ${w}×${h} @ ${FPS}fps · ${QUALITY} · ${audio_summary}"
     if [[ "$MODE" == "resolution" ]]; then
         msg "         Centered at +${x},+${y} on screen"
+    elif [[ "$MODE" == "window" ]]; then
+        msg "         Window at +${x},+${y}"
     fi
     msg "         Press ${C_BOLD}Ctrl+C${C_RESET} to stop"
     msg ""
@@ -645,12 +711,55 @@ main() {
             info "Selected area: ${w}×${h} at +${x},+${y}"
             ;;
 
+        window)
+            # 1. Let user click a window to get its geometry
+            local win_data
+            win_data="$(select_window_geometry)" || true
+            if [[ -z "${win_data:-}" ]]; then
+                msg "Window selection cancelled."
+                exit 0
+            fi
+
+            # Parse: "X Y W H TITLE..." (title may contain spaces)
+            local raw_x raw_y raw_w raw_h win_title
+            read -r raw_x raw_y raw_w raw_h win_title <<< "$win_data"
+
+            info "Window: \"${win_title}\" — ${raw_w}×${raw_h} at +${raw_x},+${raw_y}"
+
+            # 2. Get screen size for clamping
+            local screen_geom
+            screen_geom="$(get_root_geometry)" || true
+            if [[ -n "${screen_geom:-}" ]]; then
+                local sx sy sw sh
+                read -r sx sy sw sh <<< "$screen_geom"
+
+                # 3. Clamp to screen bounds if window is partially off-screen
+                local clamped
+                clamped="$(clamp_to_screen "$raw_x" "$raw_y" "$raw_w" "$raw_h" "$sw" "$sh")" || true
+                if [[ -z "${clamped:-}" ]]; then
+                    die "Window is entirely off-screen — nothing to record."
+                fi
+                read -r x y w h <<< "$clamped"
+
+                if (( x != raw_x || y != raw_y || w != raw_w || h != raw_h )); then
+                    warn "Window extends off-screen. Clamped to visible area: ${w}×${h} at +${x},+${y}"
+                fi
+            else
+                # No screen geometry available — use raw values, trust xwininfo
+                warn "Cannot detect screen size for bounds checking. Using raw window geometry."
+                x="$raw_x" y="$raw_y" w="$raw_w" h="$raw_h"
+                # Clamp negative offsets to 0 as a safety measure
+                (( x < 0 )) && x=0 || true
+                (( y < 0 )) && y=0 || true
+            fi
+
+            info "Capture region: ${w}×${h} at +${x},+${y}"
+            ;;
+
         resolution)
-            # 1. Parse the requested resolution
             local rw rh
             read -r rw rh <<< "$(parse_resolution "$REQUESTED_RES")"
 
-            # 2. Get the actual screen size
             local screen_geom
             screen_geom="$(get_root_geometry)" || true
             [[ -n "${screen_geom:-}" ]] || die "Cannot detect screen size. Install xrandr, xwininfo, or xdpyinfo."
@@ -661,7 +770,6 @@ main() {
             info "Screen size: ${sw}×${sh}"
             info "Requested: ${rw}×${rh} (centered)"
 
-            # 3. Compute the centered capture region
             read -r x y w h <<< "$(compute_centered_geometry "$rw" "$rh" "$sw" "$sh")"
 
             info "Capture region: ${w}×${h} at +${x},+${y}"
@@ -679,7 +787,7 @@ main() {
     fi
     (( w >= 16 && h >= 16 )) || die "Capture area too small (${w}×${h}). Minimum is 16×16."
 
-    # For -f and -s modes, enforce even dimensions (resolution mode already does it)
+    # Enforce even dimensions (resolution mode already does it in compute_centered)
     if [[ "$MODE" != "resolution" ]]; then
         read -r x y w h <<< "$(enforce_even_dimensions "$x" "$y" "$w" "$h")"
     fi
@@ -690,10 +798,10 @@ main() {
     stamp="$(date '+%Y-%m-%d_%H%M%S')"
     (( ${#AUDIO_DESC[@]} > 0 )) && audio_tag="audio" || audio_tag="mute"
 
-    # Use descriptive mode tag in filename
     case "$MODE" in
         fullscreen)  mode_tag="full" ;;
         select)      mode_tag="select" ;;
+        window)      mode_tag="window" ;;
         resolution)  mode_tag="${w}x${h}" ;;
     esac
 
