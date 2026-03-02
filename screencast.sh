@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # screencast.sh — Professional X11 Screen Recorder for Linux
-# Version : 2.7.0
+# Version : 2.8.0
 # License : MIT
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
@@ -15,7 +15,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.7.0"
+readonly PROG_VERSION="2.8.0"
 readonly PROG_DESC="Professional X11 Screen Recorder"
 
 if [[ -t 2 ]]; then
@@ -62,6 +62,10 @@ ${C_BOLD}CAPTURE MODE${C_RESET} (pick one — required)
                             pixel margins from each edge (centered crop)
 
 ${C_BOLD}QUALITY PROFILE${C_RESET} (pick one — required)
+    -q0           ${C_GREEN}Maximum / Reference${C_RESET}
+                  60 fps · CRF 15 · slow preset · 384k audio · 20 Mbps VBV
+                  Near-lossless. Best source for YouTube re-encoding.
+                  Large files, slower encode — use when quality is paramount.
     -q1           ${C_GREEN}YouTube / Professional${C_RESET}
                   60 fps · CRF 18 · H.264 High · capped VBV · BT.709
     -q2           ${C_GREEN}Light / Tutorial${C_RESET}
@@ -81,6 +85,7 @@ ${C_BOLD}STOP RECORDING${C_RESET}
     Press ${C_BOLD}Ctrl+C${C_RESET} in the terminal or send SIGINT/SIGTERM.
 
 ${C_BOLD}EXAMPLES${C_RESET}
+    ${PROG_NAME} -f -q0 -a                    # Fullscreen, maximum quality, audio
     ${PROG_NAME} -f -q1 -a                    # Fullscreen, YouTube, system audio
     ${PROG_NAME} -w -q1 -a                    # Click a window, YouTube, audio
     ${PROG_NAME} -r 1280x720 -q1 -a          # Centered 720p, YouTube, audio
@@ -162,6 +167,7 @@ parse_args() {
             -a)  SYS_AUDIO=true ;;
             -v)  MIC_AUDIO=true ;;
             -m)  MUTE=true ;;
+            -q0) QUALITY="maximum" ;;
             -q1) QUALITY="youtube" ;;
             -q2) QUALITY="light" ;;
             -n)  COUNTDOWN=0 ;;
@@ -173,7 +179,7 @@ parse_args() {
         shift
     done
     [[ -n "$MODE" ]]    || die "A capture mode is required: -f, -s, -w, -r WxH, or -c L R T B"
-    [[ -n "$QUALITY" ]] || die "A quality profile is required: -q1 (youtube) or -q2 (light)"
+    [[ -n "$QUALITY" ]] || die "A quality profile is required: -q0 (maximum) -q1 (youtube) or -q2 (light)"
     if $MUTE; then SYS_AUDIO=false; MIC_AUDIO=false; fi
 }
 
@@ -198,6 +204,7 @@ check_dependencies() {
 
 apply_quality_profile() {
     case "$QUALITY" in
+        maximum) FPS=60; CRF=15; PRESET="slow";     ABR="384k"; MAXRATE="20M";   BUFSIZE="40M"   ;;
         youtube) FPS=60; CRF=18; PRESET="medium";   ABR="192k"; MAXRATE="8M";    BUFSIZE="16M"   ;;
         light)   FPS=30; CRF=26; PRESET="veryfast"; ABR="128k"; MAXRATE="2500k"; BUFSIZE="5000k" ;;
         *) die "Internal error: unknown quality '${QUALITY}'" ;;
