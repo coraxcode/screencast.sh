@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================================
 # screencast.sh — Professional X11 Screen & Audio Recorder for Linux
-# Version : 2.9.0
+# Version : 2.11.0
 # License : MIT
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac + libmp3lame)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
 #           xrandr / xwininfo / xdpyinfo (screen geometry)
+#           mpv or mplayer (webcam overlay), v4l2-ctl (camera names/filtering)
+#           droidcam-cli + adb (auto-start a DroidCam video feed)
 # Compat  : Debian/Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo
 # ============================================================================
 # Screen: YouTube-compliant MP4 — H.264 High + AAC-LC, yuv420p,
 #         movflags +faststart, closed GOP, BT.709 color, even dimensions.
 # Audio:  Standalone recording to MP3 (LAME), MP4 (AAC-LC), or WAV (PCM).
+# Webcam: Optional always-on-top face-cam overlay (mpv/mplayer), recorded live
+#         as part of the screen. Detects any V4L2 camera, including DroidCam,
+#         and can auto-start the DroidCam feed (droidcam-cli) to avoid the
+#         "green screen" you get when no client is feeding the loopback device.
 # ============================================================================
 set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.9.0"
+readonly PROG_VERSION="2.11.0"
 readonly PROG_DESC="Professional X11 Screen & Audio Recorder"
 
 # ── Colors (all messages go to stderr) ──────────────────────────────────────
@@ -43,6 +49,14 @@ AUDIO_FORMAT=""    # mp3|mp4|wav — set interactively for audio-only modes
 FPS=30  CRF=28  PRESET="veryfast"  ABR="128k"  SRATE="48000"
 MAXRATE=""  BUFSIZE=""  GOP=""
 AUDIO_INPUTS=()  AUDIO_DESC=()
+
+# ── Webcam overlay state ────────────────────────────────────────────────────
+WEBCAM=false  WEBCAM_SIZE="480x360"  WEBCAM_DEVICE=""  WEBCAM_LABEL=""
+WEBCAM_PLAYER=""  WEBCAM_PID=""
+
+# ── DroidCam state ──────────────────────────────────────────────────────────
+# DROIDCAM_SPEC: from --droidcam — "adb" | "adb:PORT" | "IP" | "IP:PORT"
+DROIDCAM_SPEC=""  DROIDCAM_PID=""
 
 # ── Messaging (ALL to stderr) ───────────────────────────────────────────────
 msg()     { printf '%s\n' "$*" >&2; }
@@ -93,6 +107,23 @@ ${C_BOLD}AUDIO MODIFIERS${C_RESET} (add audio tracks to screen recordings)
     -v            Add microphone to a screen recording (interactive picker)
     -m            Mute — disable all audio (overrides -a and -v)
 
+${C_BOLD}WEBCAM OVERLAY${C_RESET} (face-cam for the screen — captured live by the recorder)
+    -k                      Open a webcam preview window (interactive device
+                            picker). Detects any V4L2 camera, including
+                            ${C_BOLD}DroidCam${C_RESET} and OBS/virtual cameras. The window floats
+                            always-on-top and is recorded as part of the screen.
+    -K WxH                  Same as -k but set the webcam window size
+                            (e.g. ${C_BOLD}-K 480x360${C_RESET}). Default is 480x360.
+                            Opened with ${C_BOLD}mpv${C_RESET} (fallback: ${C_BOLD}mplayer${C_RESET}).
+    -D SPEC                 Auto-start the ${C_BOLD}DroidCam${C_RESET} video feed (fixes the green
+                            screen). Implies -k. SPEC is one of:
+                              ${C_BOLD}adb${C_RESET}            USB via ADB, default port 4747
+                              ${C_BOLD}adb:PORT${C_RESET}       USB via ADB on a custom port
+                              ${C_BOLD}IP${C_RESET}             Wi-Fi (e.g. 192.168.0.42), port 4747
+                              ${C_BOLD}IP:PORT${C_RESET}        Wi-Fi on a custom port
+                            Without -D, picking a DroidCam device prompts you
+                            interactively to start the feed.
+
 ${C_BOLD}GENERAL${C_RESET}
     -n            No countdown — start recording immediately
     -h, --help    Show this help
@@ -110,6 +141,10 @@ ${C_BOLD}EXAMPLES — SCREEN${C_RESET}
     ${PROG_NAME} -c 0 0 50 50 -q2            # Crop top/bottom 50px
     ${PROG_NAME} -s -q2                       # Select area, light, no audio
     ${PROG_NAME} -f -q2 -m                    # Fullscreen, light, mute
+    ${PROG_NAME} -f -q1 -a -k                 # Fullscreen + system audio + webcam
+    ${PROG_NAME} -f -q0 -v -K 480x360         # Fullscreen + mic + 480x360 webcam
+    ${PROG_NAME} -f -q1 -a -D adb             # Webcam via DroidCam over USB (ADB)
+    ${PROG_NAME} -f -q1 -a -D 192.168.0.42    # Webcam via DroidCam over Wi-Fi
 
 ${C_BOLD}EXAMPLES — AUDIO ONLY${C_RESET}
     ${PROG_NAME} -a0                          # System audio, max quality → pick format
@@ -121,6 +156,9 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
     SCREENCAST_OUTDIR    Output directory  (default: ~/Videos)
     SCREENCAST_LOG       Log file path     (default: \$XDG_RUNTIME_DIR/${PROG_NAME}.log)
     DISPLAY              X11 display       (default: :0)
+    SCREENCAST_WEBCAM_PLAYER  Force webcam player: mpv | mplayer (default: auto)
+    SCREENCAST_WEBCAM_POS     Webcam corner: br | bl | tr | tl | center (default: br)
+    SCREENCAST_WEBCAM_BORDER  Set to 1 to keep the window border (default: 0)
 
 ${C_BOLD}NOTES${C_RESET}
     • Audio-only modes (-a0…-a2, -v0…-v2) prompt you to choose MP3,
@@ -132,6 +170,15 @@ ${C_BOLD}NOTES${C_RESET}
       portions are automatically clamped to visible bounds.
     • Screen output is always YouTube-compliant MP4: H.264 High + AAC-LC,
       yuv420p, -movflags +faststart, closed GOP, BT.709 color tags.
+    • -k/-K open a live webcam window (mpv or mplayer) kept always-on-top so the
+      screen recorder captures it — ideal for Instagram/online face-cam videos.
+      Detects USB webcams and virtual cameras such as DroidCam. The webcam's own
+      audio is muted in the preview to avoid feedback; use -a/-v for sound.
+    • In -s/-w/-r/-c modes, position the webcam window inside the captured area.
+    • DroidCam shows a green screen until its client feeds the loopback device.
+      Picking a DroidCam camera makes ${PROG_NAME} offer to start that feed
+      (droidcam-cli); use -D to do it non-interactively. A feed you already
+      started yourself (in another terminal) is detected and left untouched.
     • Works on Debian, Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo.
 EOF
 }
@@ -196,6 +243,31 @@ parse_args() {
             -a)  SYS_AUDIO=true ;;
             -v)  MIC_AUDIO=true ;;
             -m)  MUTE=true ;;
+            # ── Webcam overlay (for screen modes) ───────────────────────
+            -k|--webcam) WEBCAM=true ;;
+            -K|--webcam-size)
+                WEBCAM=true
+                if [[ -z "${2:-}" ]]; then
+                    die "-K/--webcam-size requires a size argument (e.g. -K 480x360)."
+                fi
+                if [[ "${2}" == -* ]]; then
+                    die "-K/--webcam-size requires a size value, got flag '${2}'. Usage: -K 480x360"
+                fi
+                shift; WEBCAM_SIZE="$(parse_webcam_size "$1")"
+                ;;
+            -D|--droidcam)
+                WEBCAM=true
+                if [[ -z "${2:-}" ]]; then
+                    die "-D/--droidcam requires a value: adb | adb:PORT | IP | IP:PORT"
+                fi
+                if [[ "${2}" == -* ]]; then
+                    die "-D/--droidcam requires a value, got flag '${2}'. Usage: -D adb  or  -D 192.168.0.42"
+                fi
+                shift
+                parse_droidcam_spec "$1" >/dev/null \
+                    || die "Invalid -D/--droidcam value '${1}'. Use: adb | adb:PORT | IP | IP:PORT"
+                DROIDCAM_SPEC="$1"
+                ;;
             # ── Quality profiles (for screen modes) ─────────────────────
             -q0) QUALITY="maximum" ;;
             -q1) QUALITY="youtube" ;;
@@ -221,6 +293,9 @@ parse_args() {
         fi
         if $MUTE; then
             die "-m (mute) cannot be used with audio-only recording modes."
+        fi
+        if $WEBCAM; then
+            die "Webcam overlay (-k/-K/-D) is only available for screen recording modes (-f, -s, -w, -r, -c)."
         fi
     else
         # Screen modes require an explicit quality flag
@@ -254,6 +329,19 @@ check_dependencies() {
     if ! is_audio_only_mode && ($SYS_AUDIO || $MIC_AUDIO); then
         if ! command -v pactl >/dev/null 2>&1 && ! command -v arecord >/dev/null 2>&1; then
             warn "Neither pactl (PulseAudio/PipeWire) nor arecord (ALSA) found."
+        fi
+    fi
+
+    # Webcam overlay requires a player (mpv preferred, mplayer fallback)
+    if ! is_audio_only_mode && $WEBCAM; then
+        detect_webcam_player >/dev/null 2>&1 \
+            || die "Webcam overlay (-k/-K) needs mpv or mplayer. Install: apt/dnf/pacman install mpv"
+        if ! ls /dev/video* >/dev/null 2>&1; then
+            warn "No /dev/video* devices detected yet — start DroidCam / your camera before recording."
+        fi
+        if [[ -n "$DROIDCAM_SPEC" ]] && ! command -v droidcam-cli >/dev/null 2>&1; then
+            warn "-D/--droidcam given but 'droidcam-cli' is not installed; cannot auto-start the feed."
+            warn "Install the DroidCam Linux client, or start it manually (e.g. 'droidcam-cli adb 4747')."
         fi
     fi
 }
@@ -669,6 +757,394 @@ pick_audio_format() {
     success "Output format: ${AUDIO_FORMAT^^}"
 }
 
+# ════════════════════════════════════════════════════════════════════════════
+# WEBCAM OVERLAY  (always-on-top face-cam window, captured live by x11grab)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Validate/normalize a webcam window size. Echoes "WxH" (lowercase x) or dies.
+parse_webcam_size() {
+    local res="$1" rw rh
+    if [[ "$res" =~ ^([0-9]+)[xX×]([0-9]+)$ ]]; then
+        rw="${BASH_REMATCH[1]}"; rh="${BASH_REMATCH[2]}"
+    else
+        die "Invalid webcam size: '${res}'. Expected WxH (e.g. 480x360)."
+    fi
+    (( rw >= 64 && rh >= 64 )) || die "Webcam size ${rw}×${rh} too small. Minimum 64x64."
+    (( rw <= 3840 && rh <= 2160 )) || die "Webcam size ${rw}×${rh} exceeds 4K (3840x2160)."
+    echo "${rw}x${rh}"
+}
+
+# Pick the best available webcam player. Honors SCREENCAST_WEBCAM_PLAYER.
+detect_webcam_player() {
+    local forced="${SCREENCAST_WEBCAM_PLAYER:-}"
+    if [[ -n "$forced" ]]; then
+        case "$forced" in
+            mpv|mplayer)
+                command -v "$forced" >/dev/null 2>&1 \
+                    || die "SCREENCAST_WEBCAM_PLAYER=${forced} but '${forced}' is not installed."
+                echo "$forced"; return 0 ;;
+            *) die "SCREENCAST_WEBCAM_PLAYER must be 'mpv' or 'mplayer', got '${forced}'." ;;
+        esac
+    fi
+    command -v mpv     >/dev/null 2>&1 && { echo "mpv";     return 0; }
+    command -v mplayer >/dev/null 2>&1 && { echo "mplayer"; return 0; }
+    return 1
+}
+
+# Human-friendly name for a /dev/videoN node (sysfs first, then v4l2-ctl).
+webcam_friendly_name() {
+    local dev="$1" idx name=""
+    idx="${dev##*video}"
+    if [[ "$idx" =~ ^[0-9]+$ && -r "/sys/class/video4linux/video${idx}/name" ]]; then
+        name="$(cat "/sys/class/video4linux/video${idx}/name" 2>/dev/null)" || true
+    fi
+    if [[ -z "$name" ]] && command -v v4l2-ctl >/dev/null 2>&1; then
+        name="$(v4l2-ctl --device="$dev" --info 2>/dev/null \
+            | awk -F': ' '/Card type/{gsub(/^[[:space:]]+/,"",$2); print $2; exit}')" || true
+    fi
+    printf '%s' "${name:-$dev}"
+}
+
+# Best-effort test: is this node a real video-capture device?
+# Without v4l2-ctl we cannot tell, so we assume yes (let the user decide).
+webcam_is_capture() {
+    local dev="$1"
+    command -v v4l2-ctl >/dev/null 2>&1 || return 0
+    if v4l2-ctl --device="$dev" --list-formats 2>/dev/null \
+        | grep -qiE 'pixel ?format|\[[0-9]+\]'; then
+        return 0
+    fi
+    # v4l2loopback / DroidCam may expose no formats until a producer connects;
+    # fall back to the capability flags.
+    v4l2-ctl --device="$dev" --all 2>/dev/null | grep -qi 'Video Capture' && return 0
+    return 1
+}
+
+# Emit "device<TAB>friendly name" for each capture-capable webcam (numeric order).
+list_video_devices() {
+    local -a nodes=()
+    local n
+    shopt -s nullglob
+    for n in /dev/video*; do [[ -c "$n" ]] && nodes+=("$n"); done
+    shopt -u nullglob
+    (( ${#nodes[@]} > 0 )) || return 1
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s\n' "${nodes[@]}" \
+        | sed 's#/dev/video##' | sort -n | sed 's#^#/dev/video#')
+    local dev rc=1
+    for dev in "${sorted[@]}"; do
+        webcam_is_capture "$dev" || continue
+        printf '%s\t%s\n' "$dev" "$(webcam_friendly_name "$dev")"
+        rc=0
+    done
+    return "$rc"
+}
+
+# Interactive webcam picker — sets WEBCAM_DEVICE and WEBCAM_LABEL, or dies.
+pick_webcam_device() {
+    require_tty
+    local -a paths=() labels=()
+    local dev name
+    while IFS=$'\t' read -r dev name; do
+        [[ -n "$dev" ]] || continue
+        paths+=("$dev")
+        labels+=("${name} (${dev})")
+    done < <(list_video_devices)
+
+    if (( ${#paths[@]} == 0 )); then
+        err "No video-capture devices found under /dev/video*."
+        err "Plug in a webcam, or start DroidCam / your virtual camera, then retry."
+        if ! id -nG 2>/dev/null | grep -qw video; then
+            err "Tip: your user may need to be in the 'video' group (then re-login):"
+            err "      sudo usermod -aG video \"\$USER\""
+        fi
+        die "Cannot enable webcam overlay."
+    fi
+
+    local chosen_label chosen=""
+    chosen_label="$(choose_from_list "Available webcams:" "${labels[@]}")"
+    local i
+    for i in "${!labels[@]}"; do
+        [[ "${labels[$i]}" == "$chosen_label" ]] && { chosen="${paths[$i]}"; break; }
+    done
+    [[ -n "$chosen" ]] || die "Failed to resolve selected webcam."
+    WEBCAM_DEVICE="$chosen"
+    WEBCAM_LABEL="$chosen_label"
+    success "Webcam: ${chosen_label}"
+}
+
+# Launch the webcam preview window in the background (best-effort, non-fatal).
+launch_webcam() {
+    $WEBCAM || return 0
+    [[ -n "$WEBCAM_DEVICE" ]] || die "Internal error: webcam enabled but no device selected."
+
+    WEBCAM_PLAYER="$(detect_webcam_player)" \
+        || die "Webcam overlay needs mpv or mplayer. Install one (e.g. apt install mpv)."
+
+    local w h
+    w="${WEBCAM_SIZE%x*}"; h="${WEBCAM_SIZE#*x}"
+
+    # Window placement: SCREENCAST_WEBCAM_POS = br|bl|tr|tl|center (default br).
+    local pos="${SCREENCAST_WEBCAM_POS:-br}" margin=24 off=""
+    case "$pos" in
+        br)        off="-${margin}-${margin}" ;;
+        bl)        off="+${margin}-${margin}" ;;
+        tr)        off="-${margin}+${margin}" ;;
+        tl)        off="+${margin}+${margin}" ;;
+        center|c)  off="" ;;
+        *) warn "Unknown SCREENCAST_WEBCAM_POS='${pos}', using bottom-right."
+           pos="br"; off="-${margin}-${margin}" ;;
+    esac
+
+    local keep_border=false
+    [[ "${SCREENCAST_WEBCAM_BORDER:-0}" == "1" ]] && keep_border=true
+
+    local -a pcmd=()
+    if [[ "$WEBCAM_PLAYER" == "mpv" ]]; then
+        pcmd=(
+            mpv "av://v4l2:${WEBCAM_DEVICE}"
+            --profile=low-latency --cache=no --no-audio
+            --title="screencast • webcam"
+            --no-osc --osd-level=0 --no-input-default-bindings
+            --geometry="${w}x${h}${off}"
+            --ontop --on-all-workspaces
+            --really-quiet
+        )
+        $keep_border && pcmd+=( --border ) || pcmd+=( --no-border )
+    else
+        # mplayer: capture size comes from -tv; geometry handles position only.
+        local mpl_geom="${off:-50%:50%}"
+        pcmd=(
+            mplayer tv://
+            -tv "driver=v4l2:device=${WEBCAM_DEVICE}:width=${w}:height=${h}"
+            -nosound -ontop -fixed-vo
+            -geometry "${mpl_geom}"
+            -really-quiet
+        )
+        $keep_border || pcmd+=( -noborder )
+    fi
+
+    {
+        echo "── webcam ──"
+        echo "PLAYER=${WEBCAM_PLAYER}  DEVICE=${WEBCAM_DEVICE}  LABEL=${WEBCAM_LABEL}"
+        echo "SIZE=${WEBCAM_SIZE}  POS=${pos}  OFFSET=${off:-center}"
+        echo "WEBCAM_CMD=${pcmd[*]}"
+    } >> "$LOGFILE"
+
+    DISPLAY="$DISPLAY_NAME" "${pcmd[@]}" >> "$LOGFILE" 2>&1 &
+    WEBCAM_PID=$!
+
+    # Give the window a moment to map before recording begins.
+    sleep 1
+    if ! kill -0 "$WEBCAM_PID" 2>/dev/null; then
+        WEBCAM_PID=""
+        warn "Webcam preview failed to start (see ${LOGFILE}). Continuing without it."
+        return 0
+    fi
+
+    success "Webcam preview opened (${WEBCAM_PLAYER}, ${WEBCAM_SIZE}, ${pos})."
+    [[ "$MODE" != "fullscreen" ]] && \
+        info "Position the webcam window inside the captured area before/while recording."
+    return 0
+}
+
+# Stop the webcam preview (graceful TERM, then KILL). Idempotent.
+stop_webcam() {
+    [[ -n "${WEBCAM_PID:-}" ]] || return 0
+    if kill -0 "$WEBCAM_PID" 2>/dev/null; then
+        kill -TERM "$WEBCAM_PID" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$WEBCAM_PID" 2>/dev/null && (( waited < 20 )); do
+            sleep 0.1; waited=$(( waited + 1 ))
+        done
+        if kill -0 "$WEBCAM_PID" 2>/dev/null; then
+            kill -KILL "$WEBCAM_PID" 2>/dev/null || true
+        fi
+    fi
+    wait "$WEBCAM_PID" 2>/dev/null || true
+    WEBCAM_PID=""
+}
+
+# ── DroidCam feed (fixes the "green screen" of an unfed loopback device) ─────
+
+# Parse a --droidcam SPEC. Echoes "mode|ip|port" or returns 1.
+#   adb | adb:PORT          -> mode=adb,  ip="",  port
+#   IP  | IP:PORT | host... -> mode=wifi, ip=IP,  port
+parse_droidcam_spec() {
+    local spec="$1" mode ip port
+    if [[ "$spec" =~ ^adb(:([0-9]+))?$ ]]; then
+        mode="adb"; ip=""; port="${BASH_REMATCH[2]:-4747}"
+    elif [[ "$spec" =~ ^([^:[:space:]]+):([0-9]+)$ ]]; then
+        mode="wifi"; ip="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    elif [[ -n "$spec" && "$spec" != *:* && "$spec" != *[[:space:]]* ]]; then
+        mode="wifi"; ip="$spec"; port="4747"
+    else
+        return 1
+    fi
+    (( port >= 1 && port <= 65535 )) || return 1
+    printf '%s|%s|%s\n' "$mode" "$ip" "$port"
+}
+
+# Does the selected node look like a DroidCam (by friendly name)?
+is_droidcam_device() {
+    local dev="$1" name lower
+    name="$(webcam_friendly_name "$dev")"
+    lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lower" == *droidcam* ]]
+}
+
+# Is some DroidCam producer already feeding the device (e.g. started by hand)?
+droidcam_producer_running() {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    pgrep -x droidcam-cli >/dev/null 2>&1 && return 0
+    pgrep -x droidcam     >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# Prompt helpers for the interactive DroidCam picker.
+_prompt_port() {
+    local def="$1" p
+    while true; do
+        printf '  DroidCam port [%s]: ' "$def" >&2
+        read -r p </dev/tty || die "Failed to read input."
+        [[ -z "$p" ]] && p="$def"
+        if [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )); then echo "$p"; return 0; fi
+        warn "Enter a valid port (1-65535)."
+    done
+}
+_prompt_nonempty() {
+    local label="$1" v
+    while true; do
+        printf '  %s: ' "$label" >&2
+        read -r v </dev/tty || die "Failed to read input."
+        [[ -n "$v" ]] && { echo "$v"; return 0; }
+        warn "This value cannot be empty."
+    done
+}
+
+# Launch droidcam-cli in the background; sets DROIDCAM_PID. Returns 1 on failure.
+_run_droidcam_client() {
+    local mode="$1" ip="$2" port="$3"
+    local -a dcmd=()
+    if [[ "$mode" == "adb" ]]; then
+        dcmd=( droidcam-cli adb "$port" )
+    else
+        dcmd=( droidcam-cli "$ip" "$port" )
+    fi
+
+    {
+        echo "── droidcam ──"
+        echo "MODE=${mode}  IP=${ip:-n/a}  PORT=${port}  DEVICE=${WEBCAM_DEVICE}"
+        echo "DROIDCAM_CMD=${dcmd[*]}"
+    } >> "$LOGFILE"
+
+    "${dcmd[@]}" >> "$LOGFILE" 2>&1 &
+    DROIDCAM_PID=$!
+
+    # Give the client up to ~3s to connect and start producing frames.
+    local waited=0
+    while (( waited < 30 )); do
+        kill -0 "$DROIDCAM_PID" 2>/dev/null || break
+        sleep 0.1; waited=$(( waited + 1 ))
+    done
+    if ! kill -0 "$DROIDCAM_PID" 2>/dev/null; then
+        wait "$DROIDCAM_PID" 2>/dev/null || true
+        DROIDCAM_PID=""
+        return 1
+    fi
+    return 0
+}
+
+# Decide whether/how to start the DroidCam feed for the selected webcam.
+# Best-effort and non-fatal: never aborts the recording on its own.
+maybe_start_droidcam() {
+    $WEBCAM || return 0
+    [[ -n "$WEBCAM_DEVICE" ]] || return 0
+
+    local forced=false
+    [[ -n "$DROIDCAM_SPEC" ]] && forced=true
+
+    # No explicit request and the device isn't a DroidCam → nothing to do.
+    if ! $forced && ! is_droidcam_device "$WEBCAM_DEVICE"; then
+        return 0
+    fi
+
+    if $forced; then
+        info "DroidCam auto-start requested for: ${WEBCAM_LABEL}"
+    else
+        info "DroidCam device detected: ${WEBCAM_LABEL}"
+    fi
+
+    # Respect a feed the user already started themselves.
+    if droidcam_producer_running; then
+        success "A DroidCam client is already running — using the existing feed."
+        return 0
+    fi
+
+    if ! command -v droidcam-cli >/dev/null 2>&1; then
+        warn "DroidCam shows a green screen until a client feeds video into the device."
+        warn "'droidcam-cli' is not installed. Start the feed manually in another terminal:"
+        warn "    droidcam-cli adb 4747          # USB (Android Debug Bridge)"
+        warn "    droidcam-cli <PHONE_IP> 4747   # Wi-Fi"
+        return 0
+    fi
+
+    # Resolve the connection: flag first, otherwise interactive.
+    local mode="" ip="" port=""
+    if $forced; then
+        local parsed
+        parsed="$(parse_droidcam_spec "$DROIDCAM_SPEC")" \
+            || die "Invalid --droidcam value '${DROIDCAM_SPEC}'. Use: adb | adb:PORT | IP | IP:PORT"
+        IFS='|' read -r mode ip port <<< "$parsed"
+    else
+        require_tty
+        local how
+        how="$(choose_from_list "Start the DroidCam video feed via:" \
+            "USB (ADB) — phone connected by cable" \
+            "Wi-Fi — phone on the same network" \
+            "Skip — I'll start droidcam-cli myself")"
+        case "$how" in
+            USB*)   mode="adb";  port="$(_prompt_port 4747)" ;;
+            Wi-Fi*) mode="wifi"; ip="$(_prompt_nonempty "Phone IP address (shown in the DroidCam app)")"
+                    port="$(_prompt_port 4747)" ;;
+            Skip*)  info "Skipping. Start it yourself, e.g.: droidcam-cli adb 4747"
+                    return 0 ;;
+            *)      warn "Unrecognized choice; skipping DroidCam auto-start."; return 0 ;;
+        esac
+    fi
+
+    if [[ "$mode" == "adb" ]] && ! command -v adb >/dev/null 2>&1; then
+        warn "ADB mode selected but 'adb' is not installed."
+        warn "Install it (android-tools-adb / android-tools) or droidcam-cli may not connect over USB."
+    fi
+
+    info "Starting DroidCam client (${mode}${ip:+ ${ip}}:${port})..."
+    if _run_droidcam_client "$mode" "$ip" "$port"; then
+        success "DroidCam feed started (producing into ${WEBCAM_DEVICE})."
+    else
+        warn "droidcam-cli could not start the feed (see ${LOGFILE}). Check the phone/USB/IP."
+        warn "Continuing — the preview may be green until a feed is available."
+    fi
+    return 0
+}
+
+# Stop only the DroidCam client WE started (graceful TERM, then KILL). Idempotent.
+stop_droidcam() {
+    [[ -n "${DROIDCAM_PID:-}" ]] || return 0
+    if kill -0 "$DROIDCAM_PID" 2>/dev/null; then
+        kill -TERM "$DROIDCAM_PID" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$DROIDCAM_PID" 2>/dev/null && (( waited < 20 )); do
+            sleep 0.1; waited=$(( waited + 1 ))
+        done
+        if kill -0 "$DROIDCAM_PID" 2>/dev/null; then
+            kill -KILL "$DROIDCAM_PID" 2>/dev/null || true
+        fi
+    fi
+    wait "$DROIDCAM_PID" 2>/dev/null || true
+    DROIDCAM_PID=""
+}
+
 # ── Countdown ───────────────────────────────────────────────────────────────
 run_countdown() {
     local secs="$1"
@@ -697,6 +1173,8 @@ cleanup_on_exit() {
         fi
         wait "$FFPID" 2>/dev/null || true
     fi
+    stop_webcam
+    stop_droidcam
 }
 trap 'cleanup_on_exit' EXIT
 
@@ -836,10 +1314,20 @@ build_and_run_screen() {
         else
             echo "AUDIO=none (mute)"
         fi
+        if $WEBCAM; then
+            echo "WEBCAM=enabled  DEVICE=${WEBCAM_DEVICE}  SIZE=${WEBCAM_SIZE}"
+            [[ -n "${DROIDCAM_PID:-}" ]] && echo "DROIDCAM=auto-started (pid=${DROIDCAM_PID})"
+        else
+            echo "WEBCAM=disabled"
+        fi
         echo "OUTPUT=${OUTFILE}"
         echo "CMD=${cmd[*]}"
         echo "════════════════════════════════════════════════════════════"
     } >> "$LOGFILE"
+
+    # Open the webcam overlay (if any) so it is up and positioned during the
+    # countdown and captured by the screen grabber once recording starts.
+    launch_webcam
 
     run_countdown "$COUNTDOWN"
 
@@ -854,6 +1342,9 @@ build_and_run_screen() {
         crop)       msg "         Crop L${CROP_LEFT} R${CROP_RIGHT} T${CROP_TOP} B${CROP_BOTTOM} → +${x},+${y}" ;;
         window)     msg "         Window at +${x},+${y}" ;;
     esac
+    if $WEBCAM && [[ -n "$WEBCAM_PID" ]]; then
+        msg "         webcam: ${WEBCAM_LABEL} (${WEBCAM_SIZE}, ${WEBCAM_PLAYER})"
+    fi
     msg "         Press ${C_BOLD}Ctrl+C${C_RESET} to stop"
     msg ""
 
@@ -862,6 +1353,9 @@ build_and_run_screen() {
     FFPID=$!
     wait "$FFPID" || true
     trap - INT TERM
+
+    stop_webcam
+    stop_droidcam
 
     msg ""
     msg "  ${C_BOLD}■ STOP${C_RESET}  Finalizing..."
@@ -999,6 +1493,11 @@ main() {
     fi
 
     setup_screen_audio
+
+    if $WEBCAM; then
+        pick_webcam_device
+        maybe_start_droidcam
+    fi
 
     local stamp audio_tag mode_tag
     stamp="$(date '+%Y-%m-%d_%H%M%S')"
