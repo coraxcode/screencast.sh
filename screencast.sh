@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
 # screencast.sh — Professional X11 Screen & Audio Recorder for Linux
-# Version : 2.11.0
+# Version : 2.11.1
 # License : MIT
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac + libmp3lame)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
 #           xrandr / xwininfo / xdpyinfo (screen geometry)
 #           mpv or mplayer (webcam overlay), v4l2-ctl (camera names/filtering)
 #           droidcam-cli + adb (auto-start a DroidCam video feed)
+#           i3-msg (float/size the webcam window correctly under i3)
 # Compat  : Debian/Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo
 # ============================================================================
 # Screen: YouTube-compliant MP4 — H.264 High + AAC-LC, yuv420p,
@@ -22,7 +23,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.11.0"
+readonly PROG_VERSION="2.11.1"
 readonly PROG_DESC="Professional X11 Screen & Audio Recorder"
 
 # ── Colors (all messages go to stderr) ──────────────────────────────────────
@@ -175,6 +176,9 @@ ${C_BOLD}NOTES${C_RESET}
       Detects USB webcams and virtual cameras such as DroidCam. The webcam's own
       audio is muted in the preview to avoid feedback; use -a/-v for sound.
     • In -s/-w/-r/-c modes, position the webcam window inside the captured area.
+    • Under i3 (a tiling WM), the webcam window is automatically set to floating
+      and resized to -K WxH via i3-msg; on other WMs the size hint is honored
+      directly. The default position is the bottom-right corner.
     • DroidCam shows a green screen until its client feeds the loopback device.
       Picking a DroidCam camera makes ${PROG_NAME} offer to start that feed
       (droidcam-cli); use -D to do it non-interactively. A feed you already
@@ -873,6 +877,53 @@ pick_webcam_device() {
     success "Webcam: ${chosen_label}"
 }
 
+# Tiling WMs (i3) ignore client --geometry size hints, so the webcam window
+# gets tiled instead of sized. Under i3 we explicitly float, size and place it
+# via i3-msg. No-op (returns 1) on any other WM, so non-i3 behavior is unchanged.
+apply_i3_floating() {
+    local criterion="$1" w="$2" h="$3" pos="$4" keep_border="$5"
+    command -v i3-msg >/dev/null 2>&1 || return 1
+    i3-msg -t get_version >/dev/null 2>&1 || return 1   # confirms i3 is running
+
+    # Compute a corner position from the root geometry (falls back to center).
+    local px="" py="" margin=24 rg sw="" sh=""
+    rg="$(get_root_geometry 2>/dev/null)" || true
+    if [[ -n "${rg:-}" ]]; then
+        read -r _ _ sw sh <<< "$rg" || true
+    fi
+    if [[ "${sw:-}" =~ ^[0-9]+$ && "${sh:-}" =~ ^[0-9]+$ ]]; then
+        case "$pos" in
+            br) px=$(( sw - w - margin )); py=$(( sh - h - margin )) ;;
+            bl) px=$margin;                py=$(( sh - h - margin )) ;;
+            tr) px=$(( sw - w - margin )); py=$margin ;;
+            tl) px=$margin;                py=$margin ;;
+            *)  px=""; py="" ;;   # center
+        esac
+        if [[ -n "$px" ]]; then
+            (( px < 0 )) && px=0 || true
+            (( py < 0 )) && py=0 || true
+        fi
+    fi
+
+    local cmd="[${criterion}] floating enable"
+    [[ "$keep_border" == "true" ]] || cmd+=", border pixel 0"
+    cmd+=", resize set ${w} ${h}"
+    if [[ -n "$px" ]]; then
+        cmd+=", move position ${px} px ${py} px"
+    else
+        cmd+=", move position center"
+    fi
+
+    # The window may not be mapped yet — retry briefly until i3 matches it.
+    local tries=0 out
+    while (( tries < 30 )); do
+        out="$(i3-msg "$cmd" 2>/dev/null)" || true
+        [[ "$out" == *'"success":true'* ]] && { echo "$cmd" >> "$LOGFILE"; return 0; }
+        sleep 0.1; tries=$(( tries + 1 ))
+    done
+    return 1
+}
+
 # Launch the webcam preview window in the background (best-effort, non-fatal).
 launch_webcam() {
     $WEBCAM || return 0
@@ -904,7 +955,7 @@ launch_webcam() {
         pcmd=(
             mpv "av://v4l2:${WEBCAM_DEVICE}"
             --profile=low-latency --cache=no --no-audio
-            --title="screencast • webcam"
+            --title="screencast • webcam" --x11-name=screencast-webcam
             --no-osc --osd-level=0 --no-input-default-bindings
             --geometry="${w}x${h}${off}"
             --ontop --on-all-workspaces
@@ -943,6 +994,18 @@ launch_webcam() {
     fi
 
     success "Webcam preview opened (${WEBCAM_PLAYER}, ${WEBCAM_SIZE}, ${pos})."
+
+    # Under i3 (tiling), force the window to float at the requested size.
+    local wm_criterion
+    if [[ "$WEBCAM_PLAYER" == "mpv" ]]; then
+        wm_criterion='instance="screencast-webcam"'
+    else
+        wm_criterion='class="MPlayer"'
+    fi
+    if apply_i3_floating "$wm_criterion" "$w" "$h" "$pos" "$keep_border"; then
+        info "i3 detected — webcam floated and sized to ${WEBCAM_SIZE}."
+    fi
+
     [[ "$MODE" != "fullscreen" ]] && \
         info "Position the webcam window inside the captured area before/while recording."
     return 0
