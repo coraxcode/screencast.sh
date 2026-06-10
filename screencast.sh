@@ -6,7 +6,8 @@
 # Requires: bash ≥ 4.0, ffmpeg (x11grab + libx264 + aac + libmp3lame)
 # Optional: slop (area select), pactl (Pulse/PipeWire), arecord (ALSA)
 #           xrandr / xwininfo / xdpyinfo (screen geometry)
-#           mpv or mplayer (webcam overlay), v4l2-ctl (camera names/filtering)
+#           ffplay (ships with ffmpeg) or mpv (webcam overlay),
+#           v4l2-ctl (camera names/filtering + capture-resolution detection)
 #           droidcam-cli + adb (auto-start a DroidCam video feed)
 #           i3-msg (float/size the webcam window correctly under i3)
 # Compat  : Debian/Ubuntu, Fedora, Arch, openSUSE, Void, NixOS, Gentoo
@@ -14,8 +15,9 @@
 # Screen: YouTube-compliant MP4 — H.264 High + AAC-LC, yuv420p,
 #         movflags +faststart, closed GOP, BT.709 color, even dimensions.
 # Audio:  Standalone recording to MP3 (LAME), MP4 (AAC-LC), or WAV (PCM).
-# Webcam: Optional always-on-top face-cam overlay (mpv/mplayer), recorded live
-#         as part of the screen. Detects any V4L2 camera, including DroidCam,
+# Webcam: Optional always-on-top face-cam overlay (ffplay/mpv) in landscape
+#         or portrait orientation, recorded live as part of the screen.
+#         Detects any V4L2 camera, including DroidCam,
 #         and can auto-start the DroidCam feed (droidcam-cli) to avoid the
 #         "green screen" you get when no client is feeding the loopback device.
 # ============================================================================
@@ -23,7 +25,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.11.1"
+readonly PROG_VERSION="2.12.1"
 readonly PROG_DESC="Professional X11 Screen & Audio Recorder"
 
 # ── Colors (all messages go to stderr) ──────────────────────────────────────
@@ -54,6 +56,12 @@ AUDIO_INPUTS=()  AUDIO_DESC=()
 # ── Webcam overlay state ────────────────────────────────────────────────────
 WEBCAM=false  WEBCAM_SIZE="480x360"  WEBCAM_DEVICE=""  WEBCAM_LABEL=""
 WEBCAM_PLAYER=""  WEBCAM_PID=""
+# Orientation: landscape (default) | portrait. May come from env, -O flag, or
+# the interactive picker. ORIENTATION_FROM_FLAG tracks an explicit -O.
+WEBCAM_ORIENTATION="${SCREENCAST_WEBCAM_ORIENTATION:-}"  ORIENTATION_FROM_FLAG=false
+# Internal: command array built by the player command builders, plus a cache
+# for the (slow) ffplay -alwaysontop capability probe.
+_WEBCAM_CMD=()  _FFPLAY_AOT=""
 
 # ── DroidCam state ──────────────────────────────────────────────────────────
 # DROIDCAM_SPEC: from --droidcam — "adb" | "adb:PORT" | "IP" | "IP:PORT"
@@ -115,7 +123,11 @@ ${C_BOLD}WEBCAM OVERLAY${C_RESET} (face-cam for the screen — captured live by 
                             always-on-top and is recorded as part of the screen.
     -K WxH                  Same as -k but set the webcam window size
                             (e.g. ${C_BOLD}-K 480x360${C_RESET}). Default is 480x360.
-                            Opened with ${C_BOLD}mpv${C_RESET} (fallback: ${C_BOLD}mplayer${C_RESET}).
+                            Opened with ${C_BOLD}ffplay${C_RESET} (fallback: ${C_BOLD}mpv${C_RESET}).
+    -O ORIENTATION          Webcam orientation: ${C_BOLD}landscape${C_RESET} (horizontal, default)
+                            or ${C_BOLD}portrait${C_RESET} (vertical, rotated 90°). Without -O you
+                            are prompted to choose. Requires -k/-K/-D.
+                            (e.g. ${C_BOLD}-O portrait${C_RESET})
     -D SPEC                 Auto-start the ${C_BOLD}DroidCam${C_RESET} video feed (fixes the green
                             screen). Implies -k. SPEC is one of:
                               ${C_BOLD}adb${C_RESET}            USB via ADB, default port 4747
@@ -144,6 +156,7 @@ ${C_BOLD}EXAMPLES — SCREEN${C_RESET}
     ${PROG_NAME} -f -q2 -m                    # Fullscreen, light, mute
     ${PROG_NAME} -f -q1 -a -k                 # Fullscreen + system audio + webcam
     ${PROG_NAME} -f -q0 -v -K 480x360         # Fullscreen + mic + 480x360 webcam
+    ${PROG_NAME} -f -q1 -a -k -O portrait     # Fullscreen + webcam rotated to portrait
     ${PROG_NAME} -f -q1 -a -D adb             # Webcam via DroidCam over USB (ADB)
     ${PROG_NAME} -f -q1 -a -D 192.168.0.42    # Webcam via DroidCam over Wi-Fi
 
@@ -157,7 +170,14 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
     SCREENCAST_OUTDIR    Output directory  (default: ~/Videos)
     SCREENCAST_LOG       Log file path     (default: \$XDG_RUNTIME_DIR/${PROG_NAME}.log)
     DISPLAY              X11 display       (default: :0)
-    SCREENCAST_WEBCAM_PLAYER  Force webcam player: mpv | mplayer (default: auto)
+    SCREENCAST_WEBCAM_PLAYER  Force webcam player: ffplay | mpv (default: auto —
+                              prefers ffplay, then mpv)
+    SCREENCAST_WEBCAM_ORIENTATION  Webcam orientation: landscape | portrait
+                              (default: ask interactively)
+    SCREENCAST_WEBCAM_CAPTURE  Camera capture size for ffplay, WxH. Default:
+                              auto-detect the best size the camera supports
+                              (via v4l2-ctl), targeting 1280x720. Set this to
+                              force a specific size.
     SCREENCAST_WEBCAM_POS     Webcam corner: br | bl | tr | tl | center (default: br)
     SCREENCAST_WEBCAM_BORDER  Set to 1 to keep the window border (default: 0)
 
@@ -171,10 +191,14 @@ ${C_BOLD}NOTES${C_RESET}
       portions are automatically clamped to visible bounds.
     • Screen output is always YouTube-compliant MP4: H.264 High + AAC-LC,
       yuv420p, -movflags +faststart, closed GOP, BT.709 color tags.
-    • -k/-K open a live webcam window (mpv or mplayer) kept always-on-top so the
-      screen recorder captures it — ideal for Instagram/online face-cam videos.
-      Detects USB webcams and virtual cameras such as DroidCam. The webcam's own
-      audio is muted in the preview to avoid feedback; use -a/-v for sound.
+    • -k/-K open a live webcam window (ffplay, falling back to mpv) kept
+      always-on-top so the screen recorder captures it — ideal for
+      Instagram/online face-cam videos. Detects USB webcams and virtual cameras
+      such as DroidCam. The preview has no audio, so there is no feedback;
+      use -a/-v for sound.
+    • -O / SCREENCAST_WEBCAM_ORIENTATION choose landscape or portrait. Portrait
+      rotates the camera 90° (ffmpeg transpose) and orients the window to match.
+      ffplay ships with ffmpeg, so no extra package is normally needed.
     • In -s/-w/-r/-c modes, position the webcam window inside the captured area.
     • Under i3 (a tiling WM), the webcam window is automatically set to floating
       and resized to -K WxH via i3-msg; on other WMs the size hint is honored
@@ -272,6 +296,18 @@ parse_args() {
                     || die "Invalid -D/--droidcam value '${1}'. Use: adb | adb:PORT | IP | IP:PORT"
                 DROIDCAM_SPEC="$1"
                 ;;
+            -O|--orientation)
+                if [[ -z "${2:-}" ]]; then
+                    die "-O/--orientation requires a value: landscape | portrait"
+                fi
+                if [[ "${2}" == -* ]]; then
+                    die "-O/--orientation requires a value, got flag '${2}'. Usage: -O portrait"
+                fi
+                shift
+                WEBCAM_ORIENTATION="$(normalize_orientation "$1")" \
+                    || die "Invalid orientation '${1}'. Use 'landscape' or 'portrait'."
+                ORIENTATION_FROM_FLAG=true
+                ;;
             # ── Quality profiles (for screen modes) ─────────────────────
             -q0) QUALITY="maximum" ;;
             -q1) QUALITY="youtube" ;;
@@ -306,6 +342,11 @@ parse_args() {
         [[ -n "$QUALITY" ]] || die "Screen modes require a quality profile: -q0 (maximum) -q1 (youtube) or -q2 (light)"
         if $MUTE; then SYS_AUDIO=false; MIC_AUDIO=false; fi
     fi
+
+    # -O/--orientation only makes sense together with the webcam overlay.
+    if $ORIENTATION_FROM_FLAG && ! $WEBCAM; then
+        die "-O/--orientation only applies to the webcam overlay. Add -k, -K, or -D."
+    fi
 }
 
 # ── Dependencies ────────────────────────────────────────────────────────────
@@ -336,10 +377,10 @@ check_dependencies() {
         fi
     fi
 
-    # Webcam overlay requires a player (mpv preferred, mplayer fallback)
+    # Webcam overlay requires a player (ffplay preferred, mpv fallback)
     if ! is_audio_only_mode && $WEBCAM; then
         detect_webcam_player >/dev/null 2>&1 \
-            || die "Webcam overlay (-k/-K) needs mpv or mplayer. Install: apt/dnf/pacman install mpv"
+            || die "Webcam overlay (-k/-K) needs ffplay or mpv. ffplay ships with ffmpeg; otherwise install mpv (e.g. apt/dnf/pacman install mpv)."
         if ! ls /dev/video* >/dev/null 2>&1; then
             warn "No /dev/video* devices detected yet — start DroidCam / your camera before recording."
         fi
@@ -778,20 +819,105 @@ parse_webcam_size() {
     echo "${rw}x${rh}"
 }
 
+# Normalize an orientation token. Echoes "landscape" or "portrait", else fails.
+normalize_orientation() {
+    local v
+    v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$v" in
+        landscape|l) echo "landscape"; return 0 ;;
+        portrait|p)  echo "portrait";  return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+# Orient a "WxH" window size to match an orientation. Echoes "W H".
+# Portrait → taller than wide; landscape → wider than tall (swaps only if needed).
+orient_window_size() {
+    local size="$1" orient="$2" w h t
+    w="${size%x*}"; h="${size#*x}"
+    if [[ "$orient" == "portrait" ]]; then
+        (( w > h )) && { t="$w"; w="$h"; h="$t"; } || true
+    else
+        (( h > w )) && { t="$w"; w="$h"; h="$t"; } || true
+    fi
+    echo "$w $h"
+}
+
+# Compute an absolute top-left window position for a corner, from the root
+# geometry. Echoes "X Y" for br|bl|tr|tl|center, or fails (caller may skip).
+webcam_corner_offset() {
+    local w="$1" h="$2" pos="$3" margin=24
+    local rg sw="" sh="" px py
+    rg="$(get_root_geometry 2>/dev/null)" || true
+    [[ -n "${rg:-}" ]] && read -r _ _ sw sh <<< "$rg" || true
+    [[ "${sw:-}" =~ ^[0-9]+$ && "${sh:-}" =~ ^[0-9]+$ ]] || return 1
+    case "$pos" in
+        br)        px=$(( sw - w - margin )); py=$(( sh - h - margin )) ;;
+        bl)        px=$margin;                py=$(( sh - h - margin )) ;;
+        tr)        px=$(( sw - w - margin )); py=$margin ;;
+        tl)        px=$margin;                py=$margin ;;
+        center|c)  px=$(( (sw - w) / 2 ));    py=$(( (sh - h) / 2 )) ;;
+        *)         return 1 ;;
+    esac
+    (( px < 0 )) && px=0 || true
+    (( py < 0 )) && py=0 || true
+    echo "$px $py"
+}
+
+# Cached probe: does this ffplay build support the -alwaysontop window flag?
+# The help text is captured first (rather than piped into grep -q) so that
+# grep's early exit cannot make ffplay die with SIGPIPE under 'set -o pipefail'.
+ffplay_supports_alwaysontop() {
+    if [[ -z "$_FFPLAY_AOT" ]]; then
+        local help_text
+        help_text="$(ffplay -hide_banner -h 2>&1)" || true
+        if grep -q -- '-alwaysontop' <<< "$help_text"; then
+            _FFPLAY_AOT="yes"
+        else
+            _FFPLAY_AOT="no"
+        fi
+    fi
+    [[ "$_FFPLAY_AOT" == "yes" ]]
+}
+
+# Interactive (or preset) webcam orientation. Sets WEBCAM_ORIENTATION.
+pick_webcam_orientation() {
+    if [[ -n "$WEBCAM_ORIENTATION" ]]; then
+        WEBCAM_ORIENTATION="$(normalize_orientation "$WEBCAM_ORIENTATION")" \
+            || die "Invalid webcam orientation '${WEBCAM_ORIENTATION}'. Use 'landscape' or 'portrait'."
+        info "Webcam orientation: ${WEBCAM_ORIENTATION}"
+        return 0
+    fi
+    require_tty
+    local chosen
+    chosen="$(choose_from_list "Choose webcam orientation:" \
+        "Landscape — horizontal (no rotation)" \
+        "Portrait — vertical (rotated 90°)")"
+    case "$chosen" in
+        Landscape*) WEBCAM_ORIENTATION="landscape" ;;
+        Portrait*)  WEBCAM_ORIENTATION="portrait" ;;
+        *)          die "Unexpected orientation selection: '${chosen}'" ;;
+    esac
+    success "Webcam orientation: ${WEBCAM_ORIENTATION}"
+}
+
 # Pick the best available webcam player. Honors SCREENCAST_WEBCAM_PLAYER.
+# Prefers ffplay (it ships with ffmpeg, already required), then mpv.
 detect_webcam_player() {
     local forced="${SCREENCAST_WEBCAM_PLAYER:-}"
     if [[ -n "$forced" ]]; then
         case "$forced" in
-            mpv|mplayer)
+            ffplay|mpv)
                 command -v "$forced" >/dev/null 2>&1 \
                     || die "SCREENCAST_WEBCAM_PLAYER=${forced} but '${forced}' is not installed."
                 echo "$forced"; return 0 ;;
-            *) die "SCREENCAST_WEBCAM_PLAYER must be 'mpv' or 'mplayer', got '${forced}'." ;;
+            mplayer)
+                die "SCREENCAST_WEBCAM_PLAYER=mplayer is no longer supported. Use 'ffplay' or 'mpv'." ;;
+            *) die "SCREENCAST_WEBCAM_PLAYER must be 'ffplay' or 'mpv', got '${forced}'." ;;
         esac
     fi
-    command -v mpv     >/dev/null 2>&1 && { echo "mpv";     return 0; }
-    command -v mplayer >/dev/null 2>&1 && { echo "mplayer"; return 0; }
+    command -v ffplay >/dev/null 2>&1 && { echo "ffplay"; return 0; }
+    command -v mpv    >/dev/null 2>&1 && { echo "mpv";    return 0; }
     return 1
 }
 
@@ -821,6 +947,77 @@ webcam_is_capture() {
     # v4l2loopback / DroidCam may expose no formats until a producer connects;
     # fall back to the capability flags.
     v4l2-ctl --device="$dev" --all 2>/dev/null | grep -qi 'Video Capture' && return 0
+    return 1
+}
+
+# Pick the best capture size a camera actually advertises, so ffplay never has
+# to guess. Targets SCREENCAST_WEBCAM_CAPTURE (default 1280x720): returns an
+# exact match if the camera offers it (including any size inside a stepwise or
+# continuous range), otherwise the largest advertised size that fits within the
+# target, otherwise the smallest advertised size. Echoes "WxH" on success;
+# returns 1 when v4l2-ctl is missing or nothing was found, so the caller can
+# fall back to its own default. Never fatal.
+webcam_pick_capture_size() {
+    local dev="$1"
+    command -v v4l2-ctl >/dev/null 2>&1 || return 1
+
+    local target="${SCREENCAST_WEBCAM_CAPTURE:-1280x720}" tw th
+    tw="${target%x*}"; th="${target#*x}"
+    [[ "$tw" =~ ^[0-9]+$ && "$th" =~ ^[0-9]+$ ]] || { tw=1280; th=720; }
+
+    # Emit one record per advertised size:
+    #   "D WxH"                  a discrete size
+    #   "R minWxminH maxWxmaxH"  a stepwise/continuous range (min .. max)
+    local recs
+    recs="$(v4l2-ctl --device="$dev" --list-formats-ext 2>/dev/null | awk '
+        /Size:/ {
+            n = 0
+            for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+x[0-9]+$/) toks[++n] = $i
+            if (($0 ~ /Stepwise/ || $0 ~ /Continuous/) && n >= 2)
+                print "R", toks[1], toks[n]
+            else if (n >= 1)
+                print "D", toks[n]
+        }')" || true
+    [[ -n "${recs:-}" ]] || return 1
+
+    local kind a b
+    local best="" bw=0 bh=0     # largest candidate that fits the target
+    local small="" sw=0 sh=0    # smallest candidate (last-resort fallback)
+    local minw minh maxw maxh
+    while read -r kind a b; do
+        case "$kind" in
+            D)
+                [[ "$a" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
+                maxw="${BASH_REMATCH[1]}"; maxh="${BASH_REMATCH[2]}"
+                minw="$maxw"; minh="$maxh"
+                ;;
+            R)
+                [[ "$a" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
+                minw="${BASH_REMATCH[1]}"; minh="${BASH_REMATCH[2]}"
+                [[ "$b" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
+                maxw="${BASH_REMATCH[1]}"; maxh="${BASH_REMATCH[2]}"
+                # The target itself is supported anywhere inside the range.
+                if (( tw >= minw && tw <= maxw && th >= minh && th <= maxh )); then
+                    echo "${tw}x${th}"; return 0
+                fi
+                ;;
+            *) continue ;;
+        esac
+        (( maxw >= 16 && maxh >= 16 )) || continue
+        # Exact discrete match to the target.
+        if (( maxw == tw && maxh == th )); then echo "${tw}x${th}"; return 0; fi
+        # Largest candidate that fits within the target.
+        if (( maxw <= tw && maxh <= th )) && (( maxw * maxh > bw * bh )); then
+            bw="$maxw"; bh="$maxh"; best="${maxw}x${maxh}"
+        fi
+        # Smallest candidate overall.
+        if [[ -z "$small" ]] || (( minw * minh < sw * sh )); then
+            sw="$minw"; sh="$minh"; small="${minw}x${minh}"
+        fi
+    done <<< "$recs"
+
+    if [[ -n "$best" ]]; then echo "$best"; return 0; fi
+    [[ -n "$small" ]] && { echo "$small"; return 0; }
     return 1
 }
 
@@ -924,86 +1121,166 @@ apply_i3_floating() {
     return 1
 }
 
-# Launch the webcam preview window in the background (best-effort, non-fatal).
-launch_webcam() {
-    $WEBCAM || return 0
-    [[ -n "$WEBCAM_DEVICE" ]] || die "Internal error: webcam enabled but no device selected."
+# Build the ffplay preview command into the global _WEBCAM_CMD array.
+# Low-latency live profile; window is sized via -x/-y, placed via -left/-top,
+# borderless and (when supported) always-on-top. Portrait adds transpose=2.
+# When include_capture=true, the camera is requested at capture_size (already
+# resolved by the caller from the camera's advertised sizes); the caller retries
+# with include_capture=false if even that size is rejected by the driver.
+_build_ffplay_cmd() {
+    local dev="$1" w="$2" h="$3" pos="$4" keep_border="$5" orient="$6" include_capture="$7" capture_size="$8"
 
-    WEBCAM_PLAYER="$(detect_webcam_player)" \
-        || die "Webcam overlay needs mpv or mplayer. Install one (e.g. apt install mpv)."
+    _WEBCAM_CMD=(
+        ffplay -hide_banner -loglevel error
+        -fflags nobuffer -flags low_delay -framedrop
+        -analyzeduration 0 -probesize 32 -sync ext
+        -f v4l2 -framerate 30
+    )
+    $include_capture && _WEBCAM_CMD+=( -video_size "$capture_size" )
+    _WEBCAM_CMD+=( -i "$dev" -an )
+    [[ "$orient" == "portrait" ]] && _WEBCAM_CMD+=( -vf "transpose=2" )
+    _WEBCAM_CMD+=( -window_title "screencast-webcam" -x "$w" -y "$h" )
 
-    local w h
-    w="${WEBCAM_SIZE%x*}"; h="${WEBCAM_SIZE#*x}"
+    local xy
+    xy="$(webcam_corner_offset "$w" "$h" "$pos")" || true
+    if [[ -n "${xy:-}" ]]; then
+        local px py
+        read -r px py <<< "$xy"
+        _WEBCAM_CMD+=( -left "$px" -top "$py" )
+    fi
+    $keep_border || _WEBCAM_CMD+=( -noborder )
+    ffplay_supports_alwaysontop && _WEBCAM_CMD+=( -alwaysontop )
+}
 
-    # Window placement: SCREENCAST_WEBCAM_POS = br|bl|tr|tl|center (default br).
-    local pos="${SCREENCAST_WEBCAM_POS:-br}" margin=24 off=""
+# Build the mpv preview command into the global _WEBCAM_CMD array (fallback).
+_build_mpv_cmd() {
+    local dev="$1" w="$2" h="$3" pos="$4" keep_border="$5" orient="$6"
+    local margin=24 off=""
     case "$pos" in
         br)        off="-${margin}-${margin}" ;;
         bl)        off="+${margin}-${margin}" ;;
         tr)        off="-${margin}+${margin}" ;;
         tl)        off="+${margin}+${margin}" ;;
         center|c)  off="" ;;
-        *) warn "Unknown SCREENCAST_WEBCAM_POS='${pos}', using bottom-right."
-           pos="br"; off="-${margin}-${margin}" ;;
+    esac
+    _WEBCAM_CMD=(
+        mpv "av://v4l2:${dev}"
+        --profile=low-latency --cache=no --no-audio
+        --title="screencast • webcam" --x11-name=screencast-webcam
+        --no-osc --osd-level=0 --no-input-default-bindings
+        --geometry="${w}x${h}${off}"
+        --ontop --on-all-workspaces
+    )
+    [[ "$orient" == "portrait" ]] && _WEBCAM_CMD+=( --vf=transpose=2 )
+    $keep_border && _WEBCAM_CMD+=( --border ) || _WEBCAM_CMD+=( --no-border )
+    _WEBCAM_CMD+=( --really-quiet )
+}
+
+# Append a webcam launch record to the session log.
+_log_webcam_cmd() {
+    local pos="$1" cap_forced="$2"
+    {
+        echo "── webcam ──"
+        echo "PLAYER=${WEBCAM_PLAYER}  DEVICE=${WEBCAM_DEVICE}  LABEL=${WEBCAM_LABEL}"
+        echo "SIZE=${WEBCAM_SIZE}  ORIENTATION=${WEBCAM_ORIENTATION}  POS=${pos}  CAPTURE_FORCED=${cap_forced}"
+        echo "WEBCAM_CMD=${_WEBCAM_CMD[*]}"
+    } >> "$LOGFILE"
+}
+
+# Spawn the command in _WEBCAM_CMD in the background; set WEBCAM_PID.
+# SDL_VIDEODRIVER=x11 keeps ffplay on X11 (so x11grab captures it, even under
+# XWayland); SDL_VIDEO_X11_WMCLASS gives the window a predictable WM class for
+# i3 matching. Both are harmless for mpv. Returns 0 if still alive after 1s.
+_spawn_webcam() {
+    DISPLAY="$DISPLAY_NAME" SDL_VIDEODRIVER=x11 SDL_VIDEO_X11_WMCLASS=screencast-webcam \
+        "${_WEBCAM_CMD[@]}" >> "$LOGFILE" 2>&1 &
+    WEBCAM_PID=$!
+    sleep 1
+    if kill -0 "$WEBCAM_PID" 2>/dev/null; then
+        return 0
+    fi
+    wait "$WEBCAM_PID" 2>/dev/null || true
+    WEBCAM_PID=""
+    return 1
+}
+
+# Launch the webcam preview window in the background (best-effort, non-fatal).
+launch_webcam() {
+    $WEBCAM || return 0
+    [[ -n "$WEBCAM_DEVICE" ]] || die "Internal error: webcam enabled but no device selected."
+
+    WEBCAM_PLAYER="$(detect_webcam_player)" \
+        || die "Webcam overlay needs ffplay or mpv. ffplay ships with ffmpeg; otherwise install mpv."
+
+    # Default orientation if it was never set (flag/env/picker).
+    [[ -n "$WEBCAM_ORIENTATION" ]] || WEBCAM_ORIENTATION="landscape"
+
+    # Orient the window box to match the chosen orientation.
+    local w h
+    read -r w h <<< "$(orient_window_size "$WEBCAM_SIZE" "$WEBCAM_ORIENTATION")"
+
+    # Window placement: SCREENCAST_WEBCAM_POS = br|bl|tr|tl|center (default br).
+    local pos="${SCREENCAST_WEBCAM_POS:-br}"
+    case "$pos" in
+        br|bl|tr|tl|center|c) ;;
+        *) warn "Unknown SCREENCAST_WEBCAM_POS='${pos}', using bottom-right."; pos="br" ;;
     esac
 
     local keep_border=false
     [[ "${SCREENCAST_WEBCAM_BORDER:-0}" == "1" ]] && keep_border=true
 
-    local -a pcmd=()
-    if [[ "$WEBCAM_PLAYER" == "mpv" ]]; then
-        pcmd=(
-            mpv "av://v4l2:${WEBCAM_DEVICE}"
-            --profile=low-latency --cache=no --no-audio
-            --title="screencast • webcam" --x11-name=screencast-webcam
-            --no-osc --osd-level=0 --no-input-default-bindings
-            --geometry="${w}x${h}${off}"
-            --ontop --on-all-workspaces
-            --really-quiet
-        )
-        $keep_border && pcmd+=( --border ) || pcmd+=( --no-border )
+    # Resolve the camera capture size for ffplay. An explicit
+    # SCREENCAST_WEBCAM_CAPTURE always wins; otherwise we ask the camera which
+    # sizes it actually supports and pick the best fit, falling back to 1280x720
+    # when v4l2-ctl is unavailable. A malformed value is ignored.
+    local cap=""
+    if [[ -n "${SCREENCAST_WEBCAM_CAPTURE:-}" ]]; then
+        cap="$SCREENCAST_WEBCAM_CAPTURE"
+        [[ "$cap" =~ ^[0-9]+x[0-9]+$ ]] || { warn "Ignoring invalid SCREENCAST_WEBCAM_CAPTURE='${cap}'."; cap=""; }
+    fi
+    if [[ -z "$cap" && -z "${SCREENCAST_WEBCAM_CAPTURE:-}" ]]; then
+        cap="$(webcam_pick_capture_size "$WEBCAM_DEVICE")" || cap=""
+    fi
+    [[ -n "$cap" ]] || cap="1280x720"
+
+    # Build + spawn. ffplay first uses the resolved capture size; if the driver
+    # still rejects it, it retries once letting the camera pick its own default.
+    local spawned=false
+    if [[ "$WEBCAM_PLAYER" == "ffplay" ]]; then
+        info "Webcam capture size: ${cap} (auto-falls back to the camera default if rejected)."
+        _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" true "$cap"
+        _log_webcam_cmd "$pos" "true"
+        if _spawn_webcam; then
+            spawned=true
+        else
+            warn "Webcam failed at capture size ${cap}; retrying with the camera default..."
+            _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" false "$cap"
+            _log_webcam_cmd "$pos" "false"
+            _spawn_webcam && spawned=true
+        fi
     else
-        # mplayer: capture size comes from -tv; geometry handles position only.
-        local mpl_geom="${off:-50%:50%}"
-        pcmd=(
-            mplayer tv://
-            -tv "driver=v4l2:device=${WEBCAM_DEVICE}:width=${w}:height=${h}"
-            -nosound -ontop -fixed-vo
-            -geometry "${mpl_geom}"
-            -really-quiet
-        )
-        $keep_border || pcmd+=( -noborder )
+        _build_mpv_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION"
+        _log_webcam_cmd "$pos" "n/a"
+        _spawn_webcam && spawned=true
     fi
 
-    {
-        echo "── webcam ──"
-        echo "PLAYER=${WEBCAM_PLAYER}  DEVICE=${WEBCAM_DEVICE}  LABEL=${WEBCAM_LABEL}"
-        echo "SIZE=${WEBCAM_SIZE}  POS=${pos}  OFFSET=${off:-center}"
-        echo "WEBCAM_CMD=${pcmd[*]}"
-    } >> "$LOGFILE"
-
-    DISPLAY="$DISPLAY_NAME" "${pcmd[@]}" >> "$LOGFILE" 2>&1 &
-    WEBCAM_PID=$!
-
-    # Give the window a moment to map before recording begins.
-    sleep 1
-    if ! kill -0 "$WEBCAM_PID" 2>/dev/null; then
+    if ! $spawned; then
         WEBCAM_PID=""
         warn "Webcam preview failed to start (see ${LOGFILE}). Continuing without it."
         return 0
     fi
 
-    success "Webcam preview opened (${WEBCAM_PLAYER}, ${WEBCAM_SIZE}, ${pos})."
+    success "Webcam preview opened (${WEBCAM_PLAYER}, ${w}x${h}, ${WEBCAM_ORIENTATION}, ${pos})."
 
     # Under i3 (tiling), force the window to float at the requested size.
     local wm_criterion
-    if [[ "$WEBCAM_PLAYER" == "mpv" ]]; then
-        wm_criterion='instance="screencast-webcam"'
+    if [[ "$WEBCAM_PLAYER" == "ffplay" ]]; then
+        wm_criterion='class="screencast-webcam"'
     else
-        wm_criterion='class="MPlayer"'
+        wm_criterion='instance="screencast-webcam"'
     fi
     if apply_i3_floating "$wm_criterion" "$w" "$h" "$pos" "$keep_border"; then
-        info "i3 detected — webcam floated and sized to ${WEBCAM_SIZE}."
+        info "i3 detected — webcam floated and sized to ${w}x${h}."
     fi
 
     [[ "$MODE" != "fullscreen" ]] && \
@@ -1378,7 +1655,7 @@ build_and_run_screen() {
             echo "AUDIO=none (mute)"
         fi
         if $WEBCAM; then
-            echo "WEBCAM=enabled  DEVICE=${WEBCAM_DEVICE}  SIZE=${WEBCAM_SIZE}"
+            echo "WEBCAM=enabled  DEVICE=${WEBCAM_DEVICE}  SIZE=${WEBCAM_SIZE}  ORIENTATION=${WEBCAM_ORIENTATION}"
             [[ -n "${DROIDCAM_PID:-}" ]] && echo "DROIDCAM=auto-started (pid=${DROIDCAM_PID})"
         else
             echo "WEBCAM=disabled"
@@ -1406,7 +1683,7 @@ build_and_run_screen() {
         window)     msg "         Window at +${x},+${y}" ;;
     esac
     if $WEBCAM && [[ -n "$WEBCAM_PID" ]]; then
-        msg "         webcam: ${WEBCAM_LABEL} (${WEBCAM_SIZE}, ${WEBCAM_PLAYER})"
+        msg "         webcam: ${WEBCAM_LABEL} (${WEBCAM_SIZE}, ${WEBCAM_ORIENTATION}, ${WEBCAM_PLAYER})"
     fi
     msg "         Press ${C_BOLD}Ctrl+C${C_RESET} to stop"
     msg ""
@@ -1559,6 +1836,7 @@ main() {
 
     if $WEBCAM; then
         pick_webcam_device
+        pick_webcam_orientation
         maybe_start_droidcam
     fi
 
