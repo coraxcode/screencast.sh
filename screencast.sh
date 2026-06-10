@@ -25,7 +25,7 @@ set -Euo pipefail
 IFS=$' \t\n'
 
 readonly PROG_NAME="screencast"
-readonly PROG_VERSION="2.12.1"
+readonly PROG_VERSION="2.13.0"
 readonly PROG_DESC="Professional X11 Screen & Audio Recorder"
 
 # ── Colors (all messages go to stderr) ──────────────────────────────────────
@@ -175,9 +175,13 @@ ${C_BOLD}ENVIRONMENT${C_RESET}
     SCREENCAST_WEBCAM_ORIENTATION  Webcam orientation: landscape | portrait
                               (default: ask interactively)
     SCREENCAST_WEBCAM_CAPTURE  Camera capture size for ffplay, WxH. Default:
-                              auto-detect the best size the camera supports
-                              (via v4l2-ctl), targeting 1280x720. Set this to
-                              force a specific size.
+                              auto-detect the best size + pixel format + fps the
+                              camera supports (via v4l2-ctl), targeting 1280x720
+                              and the highest frame rate for low latency. Set
+                              this to force a specific size.
+    SCREENCAST_WEBCAM_FORMAT  Force the ffmpeg input_format for ffplay
+                              (e.g. mjpeg, yuyv422). Default: auto — prefers the
+                              fastest format, usually mjpeg, to avoid webcam lag.
     SCREENCAST_WEBCAM_POS     Webcam corner: br | bl | tr | tl | center (default: br)
     SCREENCAST_WEBCAM_BORDER  Set to 1 to keep the window border (default: 0)
 
@@ -199,6 +203,10 @@ ${C_BOLD}NOTES${C_RESET}
     • -O / SCREENCAST_WEBCAM_ORIENTATION choose landscape or portrait. Portrait
       rotates the camera 90° (ffmpeg transpose) and orients the window to match.
       ffplay ships with ffmpeg, so no extra package is normally needed.
+    • To avoid webcam lag, ffplay auto-detects (via v4l2-ctl) the pixel format
+      with the highest frame rate at the chosen resolution — typically MJPEG,
+      which sustains 30 fps at 720p where raw YUYV is bandwidth-limited to ~10.
+      Override with SCREENCAST_WEBCAM_CAPTURE / SCREENCAST_WEBCAM_FORMAT.
     • In -s/-w/-r/-c modes, position the webcam window inside the captured area.
     • Under i3 (a tiling WM), the webcam window is automatically set to floating
       and resized to -K WxH via i3-msg; on other WMs the size hint is honored
@@ -950,75 +958,121 @@ webcam_is_capture() {
     return 1
 }
 
-# Pick the best capture size a camera actually advertises, so ffplay never has
-# to guess. Targets SCREENCAST_WEBCAM_CAPTURE (default 1280x720): returns an
-# exact match if the camera offers it (including any size inside a stepwise or
-# continuous range), otherwise the largest advertised size that fits within the
-# target, otherwise the smallest advertised size. Echoes "WxH" on success;
-# returns 1 when v4l2-ctl is missing or nothing was found, so the caller can
-# fall back to its own default. Never fatal.
-webcam_pick_capture_size() {
+# Map a V4L2 fourcc to the matching ffmpeg -input_format name. Echoes "" for
+# anything not in the table, so the caller simply omits -input_format.
+v4l2_fourcc_to_ffmpeg() {
+    case "$1" in
+        MJPG|JPEG) echo "mjpeg"   ;;
+        YUYV)      echo "yuyv422" ;;
+        YVYU)      echo "yvyu422" ;;
+        UYVY)      echo "uyvy422" ;;
+        YU12)      echo "yuv420p" ;;
+        YV12)      echo "yvu420p" ;;
+        NV12)      echo "nv12"    ;;
+        NV21)      echo "nv21"    ;;
+        H264)      echo "h264"    ;;
+        HEVC|H265) echo "hevc"    ;;
+        RGB3)      echo "rgb24"   ;;
+        BGR3)      echo "bgr24"   ;;
+        GREY)      echo "gray"    ;;
+        422P)      echo "yuv422p" ;;
+        *)         echo ""        ;;
+    esac
+}
+
+# Pick the lowest-latency capture configuration the camera actually advertises,
+# so ffplay never falls back to a slow default (e.g. raw YUYV at 1280x720 capped
+# to 10 fps). Targets SCREENCAST_WEBCAM_CAPTURE (default 1280x720):
+#   1. Resolution: exact target if offered (including inside a stepwise/
+#      continuous range), else the largest size that fits, else the smallest.
+#   2. Pixel format: at that resolution, the format with the highest frame rate;
+#      ties favor a compressed format (MJPEG/H.264), which sustains high fps with
+#      far less USB bandwidth — the usual cause of webcam lag.
+# Echoes "WxH|input_format|fps" (input_format and fps may be empty). Returns 1
+# when v4l2-ctl is missing or nothing usable was found. Never fatal.
+webcam_pick_capture() {
     local dev="$1"
     command -v v4l2-ctl >/dev/null 2>&1 || return 1
+    local raw
+    raw="$(v4l2-ctl --device="$dev" --list-formats-ext 2>/dev/null)" || true
+    [[ -n "${raw:-}" ]] || return 1
 
     local target="${SCREENCAST_WEBCAM_CAPTURE:-1280x720}" tw th
     tw="${target%x*}"; th="${target#*x}"
     [[ "$tw" =~ ^[0-9]+$ && "$th" =~ ^[0-9]+$ ]] || { tw=1280; th=720; }
 
-    # Emit one record per advertised size:
-    #   "D WxH"                  a discrete size
-    #   "R minWxminH maxWxmaxH"  a stepwise/continuous range (min .. max)
-    local recs
-    recs="$(v4l2-ctl --device="$dev" --list-formats-ext 2>/dev/null | awk '
+    # ── 1) Resolution ────────────────────────────────────────────────────────
+    # "D WxH" = discrete size; "R minWxminH maxWxmaxH" = stepwise/continuous.
+    local size_recs
+    size_recs="$(awk '
         /Size:/ {
             n = 0
             for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+x[0-9]+$/) toks[++n] = $i
-            if (($0 ~ /Stepwise/ || $0 ~ /Continuous/) && n >= 2)
-                print "R", toks[1], toks[n]
-            else if (n >= 1)
-                print "D", toks[n]
-        }')" || true
-    [[ -n "${recs:-}" ]] || return 1
+            if (($0 ~ /Stepwise/ || $0 ~ /Continuous/) && n >= 2) print "R", toks[1], toks[n]
+            else if (n >= 1) print "D", toks[n]
+        }' <<< "$raw")"
 
-    local kind a b
-    local best="" bw=0 bh=0     # largest candidate that fits the target
-    local small="" sw=0 sh=0    # smallest candidate (last-resort fallback)
-    local minw minh maxw maxh
+    local kind a b res="" got_exact=false
+    local bestfit="" bw=0 bh=0 small="" sw=0 sh=0 minw minh maxw maxh
     while read -r kind a b; do
-        case "$kind" in
+        case "${kind:-}" in
             D)
                 [[ "$a" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
-                maxw="${BASH_REMATCH[1]}"; maxh="${BASH_REMATCH[2]}"
-                minw="$maxw"; minh="$maxh"
-                ;;
+                maxw="${BASH_REMATCH[1]}"; maxh="${BASH_REMATCH[2]}"; minw="$maxw"; minh="$maxh" ;;
             R)
                 [[ "$a" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
                 minw="${BASH_REMATCH[1]}"; minh="${BASH_REMATCH[2]}"
                 [[ "$b" =~ ^([0-9]+)x([0-9]+)$ ]] || continue
                 maxw="${BASH_REMATCH[1]}"; maxh="${BASH_REMATCH[2]}"
-                # The target itself is supported anywhere inside the range.
                 if (( tw >= minw && tw <= maxw && th >= minh && th <= maxh )); then
-                    echo "${tw}x${th}"; return 0
-                fi
-                ;;
+                    res="${tw}x${th}"; got_exact=true; break
+                fi ;;
             *) continue ;;
         esac
         (( maxw >= 16 && maxh >= 16 )) || continue
-        # Exact discrete match to the target.
-        if (( maxw == tw && maxh == th )); then echo "${tw}x${th}"; return 0; fi
-        # Largest candidate that fits within the target.
+        if (( maxw == tw && maxh == th )); then res="${tw}x${th}"; got_exact=true; break; fi
         if (( maxw <= tw && maxh <= th )) && (( maxw * maxh > bw * bh )); then
-            bw="$maxw"; bh="$maxh"; best="${maxw}x${maxh}"
+            bw="$maxw"; bh="$maxh"; bestfit="${maxw}x${maxh}"
         fi
-        # Smallest candidate overall.
         if [[ -z "$small" ]] || (( minw * minh < sw * sh )); then
             sw="$minw"; sh="$minh"; small="${minw}x${minh}"
         fi
-    done <<< "$recs"
+    done <<< "$size_recs"
+    if ! $got_exact; then
+        if [[ -n "$bestfit" ]]; then res="$bestfit"; elif [[ -n "$small" ]]; then res="$small"; fi
+    fi
+    [[ -n "$res" ]] || return 1
 
-    if [[ -n "$best" ]]; then echo "$best"; return 0; fi
-    [[ -n "$small" ]] && { echo "$small"; return 0; }
-    return 1
+    # ── 2) Pixel format + frame rate at the chosen resolution ────────────────
+    # "FOURCC WxH FPS" per discrete (format, size, interval). \047 = apostrophe.
+    local mode_recs
+    mode_recs="$(awk '
+        { if (match($0, /\047[A-Za-z0-9]+\047/)) fourcc = substr($0, RSTART + 1, RLENGTH - 2) }
+        /Size: Discrete/ {
+            cursize = ""
+            for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+x[0-9]+$/) cursize = $i
+        }
+        /fps\)/ {
+            fps = $0; sub(/.*\(/, "", fps); sub(/[^0-9.].*/, "", fps)
+            if (fourcc != "" && cursize != "" && fps != "") print fourcc, cursize, fps
+        }' <<< "$raw")"
+
+    local fourcc size fps ifps rank
+    local best_fourcc="" best_fps=0 best_rank=-1
+    while read -r fourcc size fps; do
+        [[ "$size" == "$res" ]] || continue
+        ifps="${fps%.*}"; [[ "$ifps" =~ ^[0-9]+$ ]] || ifps=0
+        rank=0
+        case "$fourcc" in MJPG|JPEG|H264|HEVC|H265) rank=1 ;; esac
+        if (( ifps > best_fps )) || { (( ifps == best_fps )) && (( rank > best_rank )); }; then
+            best_fps="$ifps"; best_fourcc="$fourcc"; best_rank="$rank"
+        fi
+    done <<< "$mode_recs"
+
+    local ifmt out_fps=""
+    ifmt="$(v4l2_fourcc_to_ffmpeg "$best_fourcc")"
+    (( best_fps >= 1 )) && out_fps="$best_fps"
+    printf '%s|%s|%s\n' "$res" "$ifmt" "$out_fps"
 }
 
 # Emit "device<TAB>friendly name" for each capture-capable webcam (numeric order).
@@ -1124,19 +1178,29 @@ apply_i3_floating() {
 # Build the ffplay preview command into the global _WEBCAM_CMD array.
 # Low-latency live profile; window is sized via -x/-y, placed via -left/-top,
 # borderless and (when supported) always-on-top. Portrait adds transpose=2.
-# When include_capture=true, the camera is requested at capture_size (already
-# resolved by the caller from the camera's advertised sizes); the caller retries
-# with include_capture=false if even that size is rejected by the driver.
+# When include_capture=true the camera is pinned to capture_size, input_format
+# and fps (resolved by the caller from the camera's advertised modes) so the
+# driver cannot pick a slow default; the caller retries with include_capture=
+# false (camera negotiates everything) if that exact mode is rejected.
 _build_ffplay_cmd() {
-    local dev="$1" w="$2" h="$3" pos="$4" keep_border="$5" orient="$6" include_capture="$7" capture_size="$8"
+    local dev="$1" w="$2" h="$3" pos="$4" keep_border="$5" orient="$6"
+    local include_capture="$7" capture_size="$8" input_format="${9:-}" fps="${10:-}"
+
+    local fr="30"
+    [[ "$fps" =~ ^[0-9]+$ ]] && (( fps >= 1 )) && fr="$fps"
 
     _WEBCAM_CMD=(
         ffplay -hide_banner -loglevel error
         -fflags nobuffer -flags low_delay -framedrop
         -analyzeduration 0 -probesize 32 -sync ext
-        -f v4l2 -framerate 30
+        -f v4l2
     )
-    $include_capture && _WEBCAM_CMD+=( -video_size "$capture_size" )
+    if $include_capture; then
+        [[ -n "$input_format" ]] && _WEBCAM_CMD+=( -input_format "$input_format" )
+        _WEBCAM_CMD+=( -framerate "$fr" -video_size "$capture_size" )
+    else
+        _WEBCAM_CMD+=( -framerate "$fr" )
+    fi
     _WEBCAM_CMD+=( -i "$dev" -an )
     [[ "$orient" == "portrait" ]] && _WEBCAM_CMD+=( -vf "transpose=2" )
     _WEBCAM_CMD+=( -window_title "screencast-webcam" -x "$w" -y "$h" )
@@ -1229,32 +1293,40 @@ launch_webcam() {
     local keep_border=false
     [[ "${SCREENCAST_WEBCAM_BORDER:-0}" == "1" ]] && keep_border=true
 
-    # Resolve the camera capture size for ffplay. An explicit
-    # SCREENCAST_WEBCAM_CAPTURE always wins; otherwise we ask the camera which
-    # sizes it actually supports and pick the best fit, falling back to 1280x720
-    # when v4l2-ctl is unavailable. A malformed value is ignored.
-    local cap=""
-    if [[ -n "${SCREENCAST_WEBCAM_CAPTURE:-}" ]]; then
-        cap="$SCREENCAST_WEBCAM_CAPTURE"
-        [[ "$cap" =~ ^[0-9]+x[0-9]+$ ]] || { warn "Ignoring invalid SCREENCAST_WEBCAM_CAPTURE='${cap}'."; cap=""; }
+    # Resolve the camera capture configuration for ffplay (size + pixel format +
+    # fps). The goal is low latency: pinning the right format prevents the driver
+    # from defaulting to a slow mode (e.g. raw YUYV at 1280x720 capped to 10 fps).
+    #   • SCREENCAST_WEBCAM_CAPTURE  forces the resolution (still auto-picks the
+    #                                fastest format for that size).
+    #   • SCREENCAST_WEBCAM_FORMAT   forces the ffmpeg input_format (e.g. mjpeg).
+    #   • Otherwise everything is auto-detected via v4l2-ctl, targeting 1280x720,
+    #     falling back to 1280x720 with no pinned format when detection fails.
+    local forced_size="${SCREENCAST_WEBCAM_CAPTURE:-}"
+    if [[ -n "$forced_size" && ! "$forced_size" =~ ^[0-9]+x[0-9]+$ ]]; then
+        warn "Ignoring invalid SCREENCAST_WEBCAM_CAPTURE='${forced_size}'."
+        forced_size=""
     fi
-    if [[ -z "$cap" && -z "${SCREENCAST_WEBCAM_CAPTURE:-}" ]]; then
-        cap="$(webcam_pick_capture_size "$WEBCAM_DEVICE")" || cap=""
-    fi
-    [[ -n "$cap" ]] || cap="1280x720"
 
-    # Build + spawn. ffplay first uses the resolved capture size; if the driver
-    # still rejects it, it retries once letting the camera pick its own default.
+    local cap="" ifmt="" cfps="" probe=""
+    probe="$(SCREENCAST_WEBCAM_CAPTURE="${forced_size:-1280x720}" webcam_pick_capture "$WEBCAM_DEVICE")" || probe=""
+    [[ -n "$probe" ]] && IFS='|' read -r cap ifmt cfps <<< "$probe"
+
+    [[ -n "$forced_size" ]] && cap="$forced_size"           # forced resolution wins
+    [[ -n "$cap" ]] || cap="1280x720"
+    [[ -n "${SCREENCAST_WEBCAM_FORMAT:-}" ]] && ifmt="$SCREENCAST_WEBCAM_FORMAT"  # forced format wins
+
+    # Build + spawn. ffplay first uses the resolved size/format/fps; if the driver
+    # rejects that exact mode, it retries once letting the camera negotiate.
     local spawned=false
     if [[ "$WEBCAM_PLAYER" == "ffplay" ]]; then
-        info "Webcam capture size: ${cap} (auto-falls back to the camera default if rejected)."
-        _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" true "$cap"
+        info "Webcam capture: ${cap}${cfps:+ @ ${cfps}fps}${ifmt:+ [${ifmt}]} (auto-selected for low latency; falls back if rejected)."
+        _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" true "$cap" "$ifmt" "$cfps"
         _log_webcam_cmd "$pos" "true"
         if _spawn_webcam; then
             spawned=true
         else
-            warn "Webcam failed at capture size ${cap}; retrying with the camera default..."
-            _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" false "$cap"
+            warn "Webcam failed at ${cap}${ifmt:+/${ifmt}}; retrying with the camera default..."
+            _build_ffplay_cmd "$WEBCAM_DEVICE" "$w" "$h" "$pos" "$keep_border" "$WEBCAM_ORIENTATION" false "$cap" "$ifmt" "$cfps"
             _log_webcam_cmd "$pos" "false"
             _spawn_webcam && spawned=true
         fi
